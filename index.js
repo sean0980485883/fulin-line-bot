@@ -1,4 +1,5 @@
 
+
 const express = require("express");
 const crypto = require("crypto");
 const axios = require("axios");
@@ -290,13 +291,18 @@ async function translateText(text) {
       model: "claude-sonnet-4-20250514",
       max_tokens: 1024,
       system: `你是翻譯助理，根據輸入語言自動判斷並翻譯。
-格式：
-🇹🇼 Thai → [翻譯結果]
-🇺🇸 English → [翻譯結果]
-🇹🇼 中文 → [翻譯結果]
 
-若輸入是中文 → 翻譯成泰文+英文
-若輸入是泰文/英文 → 翻譯成中文`,
+規則：
+1. 訊息開頭若有 @人名、@英文名、@符號 等 LINE 提及標記，直接忽略，只翻譯後面的句子內容
+2. 若 @提及 後面沒有任何實質內容，則完全不回應
+3. 翻譯格式（緊湊，每行一個翻譯，只用國旗符號，不加其他文字）：
+   - 輸入是中文 → 🇹🇭 [泰文翻譯]
+                   🇺🇸 [英文翻譯]
+   - 輸入是泰文 → 🇹🇼 [中文翻譯]
+                   🇺🇸 [英文翻譯]
+   - 輸入是英文 → 🇹🇼 [中文翻譯]
+                   🇹🇭 [泰文翻譯]
+4. 只輸出翻譯結果，不加任何解釋、說明或多餘空行`,
       messages: [{ role: "user", content: text }]
     },
     {
@@ -706,12 +712,15 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       // （如 @王先生、@all 等 LINE 提及，直接翻譯即可）
 
       if (!isTranslateOn(sourceId)) {
-        // 翻譯關閉，靜默忽略
         continue;
       }
 
-      console.log("[Translate] input:", text.substring(0, 50));
-      const translated = await translateText(text);
+      // 剝掉開頭的 @提及（@人名、@all 等），只翻譯後面的內容
+      const stripped = text.replace(/^@\S+\s*/, "").trim();
+      if (!stripped) continue; // @提及後面沒有內容，跳過
+
+      console.log("[Translate] input:", stripped.substring(0, 50));
+      const translated = await translateText(stripped);
       console.log("[Translate] output:", translated.substring(0, 50));
       await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
 
