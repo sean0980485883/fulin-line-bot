@@ -22,13 +22,15 @@ let allowedUsers = process.env.ALLOWED_USER_IDS
   ? new Set(process.env.ALLOWED_USER_IDS.split(",").map(id => id.trim()).filter(Boolean))
   : new Set();
 
-// ─── 翻譯開關（記憶體，重啟後重置） ─────────────────────────────
+// ─── 忽略記事的群組（不觸發自動關鍵字記事） ──────────────────────
+const ignoredGroups = new Set();
+
 // key: groupId 或 userId，value: true/false
 const translateEnabled = new Map();
 
 function isTranslateOn(sourceId) {
-  // 預設關閉，需手動傳 @開翻譯 才啟動
-  return translateEnabled.get(sourceId) === true;
+  // 預設開啟，傳 @關翻譯 才關閉
+  return translateEnabled.get(sourceId) !== false;
 }
 
 // ─── 自動抓取群組名稱（LINE Group Summary API） ───────────────
@@ -371,7 +373,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       if (["@目錄", "@选单", "@選單", "@menu", "@產品目錄"].includes(text)) {
         await replyMessages(replyToken, [{
           type: "text",
-          text: `📋 富林組合屋 產品目錄\n（輸入 @品名 查詢詳情）\n\n🏠 框架顏色搭配：\n@黑框木紋　@黑框白板　@黑框灰黑\n@白框木紋　@白框白板　@白框灰黑\n\n🚿 衛浴系列：\n@大衛浴　@小衛浴　@水泥廁所\n@室外衛浴　@貼磁衛浴　@日式衛浴\n\n🏢 屋型系列：\n@二樓　@三樓　@展翼屋　@20呎展翼屋\n@折疊屋　@宿舍\n\n🛋 配件系列：\n@廚具　@SPC地板　@三合一門　@標準窗　@沙門\n\n📩 完整 DM 報價：\n@DM\n\n說明：輸入「@黑框木紋」查詢詳情`
+          text: `📋 富林組合屋 產品目錄\n（輸入 @品名 查詢詳情）\n\n🏠 框架顏色搭配：\n@黑框木紋　@黑框白板　@黑框灰黑\n@白框木紋　@白框白板　@白框灰黑\n\n🚿 衛浴系列：\n@大衛浴　@小衛浴　@水泥廁所\n@室外衛浴　@貼磁衛浴　@日式衛浴\n\n🏢 屋型系列：\n@二樓　@三樓　@展翼屋　@20呎展翼屋\n@折疊屋　@宿舍\n\n🛋 配件系列：\n@廚具　@SPC地板　@三合一門　@標準窗　@沙門\n\n📩 完整 DM 報價：\n@DM\n\n${'─'.repeat(18)}\n🌐 翻譯功能：\n直接傳任何文字即可自動翻譯\n中文 ↔ 泰文 ↔ 英文\n@關翻譯 關閉 ｜ @開翻譯 開啟`
         }], quoteToken);
         continue;
       }
@@ -498,7 +500,48 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       // 📝 記事系統（僅管理員，群組靜默，回覆到私訊）
       // ════════════════════════════════════════
 
-      // @命名 群組名稱（手動覆蓋自動取得的名稱，可選）
+      // @忽略記事（此群組不再自動記事）
+      if (["@忽略記事", "@忽略"].includes(text)) {
+        if (!isAdmin) continue;
+        ignoredGroups.add(sourceId);
+        const g = await getOrCreateGroup(sourceId, event.source);
+        console.log("[Ignore] 新增忽略群組:", g.name);
+        await pushMessage(userId, [{
+          type: "text",
+          text: `🚫 【${g.name}】已設為忽略\n此群組的訊息不再自動記事\n\n傳 @恢復記事 可重新啟用`
+        }]);
+        continue;
+      }
+
+      // @恢復記事
+      if (["@恢復記事", "@恢復"].includes(text)) {
+        if (!isAdmin) continue;
+        ignoredGroups.delete(sourceId);
+        const g = await getOrCreateGroup(sourceId, event.source);
+        console.log("[Ignore] 移除忽略群組:", g.name);
+        await pushMessage(userId, [{
+          type: "text",
+          text: `✅ 【${g.name}】已恢復自動記事`
+        }]);
+        continue;
+      }
+
+      // @忽略列表
+      if (["@忽略列表"].includes(text)) {
+        if (!isAdmin) continue;
+        if (ignoredGroups.size === 0) {
+          await pushMessage(userId, [{ type: "text", text: "📋 目前沒有設定忽略的群組" }]);
+        } else {
+          const names = [...ignoredGroups].map(id => {
+            const g = groups.get(id);
+            return g ? `• 【${g.name}】` : `• ${id.substring(0, 8)}...`;
+          }).join("\n");
+          await pushMessage(userId, [{ type: "text", text: `🚫 忽略記事的群組（${ignoredGroups.size} 組）：\n\n${names}` }]);
+        }
+        continue;
+      }
+
+
       if (text.startsWith("@命名")) {
         if (!isAdmin) continue; // 非管理員靜默忽略
         const name = text.replace(/^@命名\s*/, "").trim();
@@ -617,12 +660,50 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       }
 
       // ════════════════════════════════════════
+      // 🔔 關鍵字自動記事（靜默推播給管理員）
+      // ════════════════════════════════════════
+      const AUTO_KEYWORDS = [
+        // 中文
+        "報價", "訂購", "預約", "確認", "合約", "付款", "匯款",
+        "多少錢", "什麼時候", "可以嗎", "麻煩", "簽約", "要訂",
+        "幫我", "能不能", "何時", "幾號", "幾點", "需要",
+        // 泰文
+        "ราคา", "สั่ง", "นัด", "ยืนยัน", "เท่าไร", "จ่าย",
+        "สัญญา", "เมื่อไร", "ได้ไหม", "ช่วย", "ต้องการ", "อยาก"
+      ];
+
+      const hitKeyword = AUTO_KEYWORDS.find(kw => text.includes(kw));
+      if (hitKeyword && ADMIN_IDS.length > 0 && !isAdmin && !ignoredGroups.has(sourceId)) {
+        // 自動建立記事
+        const g = await getOrCreateGroup(sourceId, event.source);
+        const newTask = {
+          id: taskIdCounter++,
+          text: text.substring(0, 80), // 最多 80 字
+          done: false,
+          createdAt: new Date(),
+          auto: true
+        };
+        g.tasks.push(newTask);
+
+        const now = new Date();
+        const timeStr = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+        console.log("[AutoTask] 關鍵字:", hitKeyword, "| 群組:", g.name, "| 記事:", newTask.text);
+
+        // 靜默推播給所有管理員
+        ADMIN_IDS.forEach(adminId => {
+          pushMessage(adminId, [{
+            type: "text",
+            text: `🔔 自動記事 #${newTask.id}\n群組：【${g.name}】\n關鍵字：${hitKeyword}\n內容：${newTask.text}\n時間：${timeStr}\n\n傳 @完成 ${newTask.id} 標記完成`
+          }]);
+        });
+        // 不 continue，讓翻譯照常執行（如果有開的話）
+      }
+
+      // ════════════════════════════════════════
       // 🌐 翻譯（需開啟且不是 @ 指令）
       // ════════════════════════════════════════
-      if (text.startsWith("@")) {
-        // 未知的 @ 指令，不處理
-        continue;
-      }
+      // @ 開頭但不是已知指令 → 視為一般訊息，繼續翻譯
+      // （如 @王先生、@all 等 LINE 提及，直接翻譯即可）
 
       if (!isTranslateOn(sourceId)) {
         // 翻譯關閉，靜默忽略
