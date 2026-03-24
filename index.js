@@ -1,5 +1,4 @@
 
-
 const express = require("express");
 const crypto = require("crypto");
 const axios = require("axios");
@@ -295,14 +294,17 @@ async function translateText(text) {
 規則：
 1. 訊息開頭若有 @人名、@英文名、@符號 等 LINE 提及標記，直接忽略，只翻譯後面的句子內容
 2. 若 @提及 後面沒有任何實質內容，則完全不回應
-3. 翻譯格式（緊湊，每行一個翻譯，只用國旗符號，不加其他文字）：
-   - 輸入是中文 → 🇹🇭 [泰文翻譯]
-                   🇺🇸 [英文翻譯]
-   - 輸入是泰文 → 🇹🇼 [中文翻譯]
-                   🇺🇸 [英文翻譯]
-   - 輸入是英文 → 🇹🇼 [中文翻譯]
-                   🇹🇭 [泰文翻譯]
-4. 只輸出翻譯結果，不加任何解釋、說明或多餘空行`,
+3. 翻譯格式：國旗符號 + 空格 + 翻譯內容，每行一個，不加任何其他文字：
+   - 輸入是中文 →
+     🇹🇭 [泰文翻譯]
+     🇺🇸 [英文翻譯]
+   - 輸入是泰文 →
+     🇹🇼 [中文翻譯]
+     🇺🇸 [英文翻譯]
+   - 輸入是英文 →
+     🇹🇼 [中文翻譯]
+     🇹🇭 [泰文翻譯]
+4. 只輸出兩行翻譯，不加冒號、箭頭、語言名稱或任何說明`,
       messages: [{ role: "user", content: text }]
     },
     {
@@ -715,9 +717,16 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         continue;
       }
 
+      // 整則訊息若只有 emoji / 符號 / 數字，沒有任何文字 → 直接跳過，不翻譯
+      if (!/[\p{L}\p{M}]/u.test(text)) continue;
+
       // 剝掉開頭的 @提及（@人名、@all 等），只翻譯後面的內容
       const stripped = text.replace(/^@\S+\s*/, "").trim();
-      if (!stripped) continue; // @提及後面沒有內容，跳過
+      if (!stripped) continue;
+
+      // 只有 emoji / 符號 / 數字，沒有實際文字 → 跳過
+      const hasRealText = /[\p{L}\p{M}]/u.test(stripped);
+      if (!hasRealText) continue;
 
       console.log("[Translate] input:", stripped.substring(0, 50));
       const translated = await translateText(stripped);
