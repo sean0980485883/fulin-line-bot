@@ -287,7 +287,7 @@ async function translateText(text) {
   const r = await axios.post(
     "https://api.anthropic.com/v1/messages",
     {
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 1024,
       system: `你是翻譯助理，根據輸入語言自動判斷並翻譯。
 
