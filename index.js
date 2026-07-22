@@ -2,29 +2,80 @@ const express = require("express");
 const crypto = require("crypto");
 const axios = require("axios");
 const path = require("path");
-
 const app = express();
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const BASE_URL = process.env.BASE_URL;
 const PORT = process.env.PORT || 3000;
-
 const ADMIN_IDS = process.env.ADMIN_IDS
   ? process.env.ADMIN_IDS.split(",").map(id => id.trim()).filter(Boolean)
   : [];
-
 let allowedUsers = process.env.ALLOWED_USER_IDS
   ? new Set(process.env.ALLOWED_USER_IDS.split(",").map(id => id.trim()).filter(Boolean))
   : new Set();
-
 const ignoredGroups = new Set();
+// ─── 定時提醒系統 ──────────────────────────────────────────────
+// 結構：Map<sourceId, [{id, hour, minute, message, timerId}]>
+const groupReminders = new Map();
+let reminderIdCounter = 1;
+function getTWNow() {
+  // 台灣時間 UTC+8
+  const now = new Date();
+  const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  return tw;
+}
+function getNextTriggerMs(hour, minute) {
+  const now = new Date();
+  const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  const next = new Date(tw);
+  next.setUTCHours(hour - 8 < 0 ? hour - 8 + 24 : hour - 8, minute, 0, 0);
+  // 換算回 UTC
+  const nextUTC = new Date(next.getTime());
+  if (nextUTC <= now) nextUTC.setUTCDate(nextUTC.getUTCDate() + 1);
+  return nextUTC - now;
+}
+function scheduleReminder(sourceId, reminder) {
+  const { hour, minute, message, id } = reminder;
+  function trigger() {
+    const tw = getTWNow();
+    console.log(`[Reminder #${id}] 發送提醒到 ${sourceId}：${message}`);
+    // 在群組發送真的 @全體 通知 + 提醒內容
+    pushToGroup(sourceId, `⏰ ${message}`);
+    // 設定下一次（24小時後）
+    reminder.timerId = setTimeout(trigger, getNextTriggerMs(hour, minute));
+  }
+  const delay = getNextTriggerMs(hour, minute);
+  const nextTW = new Date(Date.now() + delay + 8 * 60 * 60 * 1000);
+  console.log(`[Reminder #${id}] 下次發送：台灣時間 ${String(nextTW.getUTCHours()).padStart(2,'0')}:${String(nextTW.getUTCMinutes()).padStart(2,'0')}（${Math.round(delay/1000/60)} 分鐘後）`);
+  reminder.timerId = setTimeout(trigger, delay);
+}
+// ─── LINE Push 到群組（用 Push API，並用 textV2 真的 @全體 通知） ──────
+async function pushToGroup(groupId, text) {
+  try {
+    const r = await axios.post(
+      "https://api.line.me/v2/bot/message/push",
+      {
+        to: groupId,
+        messages: [{
+          type: "textV2",
+          text: "{everyone}\n" + text,
+          substitution: {
+            everyone: { type: "mention", mentionee: { type: "all" } }
+          }
+        }]
+      },
+      { headers: { Authorization: "Bearer " + LINE_CHANNEL_ACCESS_TOKEN, "Content-Type": "application/json" }, timeout: 10000 }
+    );
+    console.log("[PushGroup] to:", groupId, "status:", r.status);
+  } catch (err) {
+    console.error("[PushGroup ERROR]", groupId, err.response ? JSON.stringify(err.response.data) : err.message);
+  }
+}
 const translateEnabled = new Map();
-
 // ─── 語言模式系統 ─────────────────────────────────────────────
 // 每個群組獨立設定語言模式
 const groupLangMode = new Map();
-
 const LANG_MODES = {
   ZH_TH_EN: {
     name: "中泰英",
@@ -65,15 +116,12 @@ const LANG_MODES = {
 4. 只輸出翻譯結果，不加冒號、箭頭、語言名稱或任何說明`
   }
 };
-
 function getGroupMode(sourceId) {
   return groupLangMode.get(sourceId) || "ZH_TH_EN";
 }
-
 function isTranslateOn(sourceId) {
   return translateEnabled.get(sourceId) !== false;
 }
-
 // ─── 群組管理 ──────────────────────────────────────────────────
 async function fetchGroupName(groupId) {
   try {
@@ -86,10 +134,8 @@ async function fetchGroupName(groupId) {
     return groupId.substring(0, 8) + "...";
   }
 }
-
 const groups = new Map();
 let taskIdCounter = 1;
-
 async function getOrCreateGroup(sourceId, eventSource = null) {
   if (!groups.has(sourceId)) {
     groups.set(sourceId, { name: sourceId.substring(0, 8) + "...", lastActiveAt: new Date(), tasks: [] });
@@ -104,15 +150,12 @@ async function getOrCreateGroup(sourceId, eventSource = null) {
   }
   return groups.get(sourceId);
 }
-
 function touchGroup(sourceId) {
   if (groups.has(sourceId)) groups.get(sourceId).lastActiveAt = new Date();
 }
-
 function daysSince(date) {
   return Math.floor((new Date() - date) / (1000 * 60 * 60 * 24));
 }
-
 function formatLastActive(date) {
   const days = daysSince(date);
   const t = `${String(date.getHours()).padStart(2,"0")}:${String(date.getMinutes()).padStart(2,"0")}`;
@@ -120,7 +163,6 @@ function formatLastActive(date) {
   if (days === 1) return `昨天 ${t}`;
   return `${String(date.getMonth()+1).padStart(2,"0")}/${String(date.getDate()).padStart(2,"0")} ${t}`;
 }
-
 function getGroupTasksText(sourceId) {
   const g = groups.get(sourceId);
   if (!g) return "📋 此群組尚無記事";
@@ -132,7 +174,6 @@ function getGroupTasksText(sourceId) {
   if (done.length) { msg += `\n✅ 已完成（${done.length} 件）\n`; done.forEach(t => { msg += `  ✔ ${t.text}\n`; }); }
   return msg.trim();
 }
-
 function buildDailyReport() {
   const now = new Date();
   const dateStr = `${now.getFullYear()}/${String(now.getMonth()+1).padStart(2,"0")}/${String(now.getDate()).padStart(2,"0")}`;
@@ -156,7 +197,6 @@ function buildDailyReport() {
   msg += `${"═".repeat(22)}\n共 ${total} 組 | ${totalTasks} 件待辦`;
   return msg;
 }
-
 async function pushMessage(toUserId, messages) {
   try {
     const r = await axios.post("https://api.line.me/v2/bot/message/push",
@@ -168,17 +208,14 @@ async function pushMessage(toUserId, messages) {
     console.error("[Push ERROR]", toUserId, err.response ? JSON.stringify(err.response.data) : err.message);
   }
 }
-
 function scheduleDailyReport() {
   function getNext() { const n = new Date(); n.setUTCHours(10,0,0,0); if (n <= new Date()) n.setUTCDate(n.getUTCDate()+1); return n - new Date(); }
   function trigger() { ADMIN_IDS.forEach(id => pushMessage(id, [{ type: "text", text: buildDailyReport() }])); setTimeout(trigger, getNext()); }
   console.log(`[DailyReport] 下次：${new Date(Date.now()+getNext()).toISOString()}`);
   setTimeout(trigger, getNext());
 }
-
 app.use("/images", express.static(path.join(__dirname, "public/images")));
 function img(f) { return BASE_URL + "/images/" + encodeURIComponent(f); }
-
 const PRODUCTS = {
   "黑框木紋": { label: "黑框木紋 ★熱門★", description: "黑色鐵框搭配木紋面板，工業風與自然感完美融合\n尺寸：多規格可選\n\n▶️ 影片：https://youtu.be/Xqw4Utll1yk\n📩 如需報價請洽詢", images: ["https://img.youtube.com/vi/Xqw4Utll1yk/maxresdefault.jpg", img("黑框木紋_02.png"), img("黑框木紋_03.jpg")] },
   "白框木紋": { label: "白框木紋", description: "清爽白框搭配木紋面板，現代簡約風格\n📩 如需報價請洽詢", images: [img("白框木紋_01.jpg"), img("白框木紋_02.jpg"), img("白框木紋_03.jpg")] },
@@ -205,9 +242,7 @@ const PRODUCTS = {
   "沙門": { label: "沙門（安全紗門）", description: "菱格鐵網安全紗門，通風防盜兼顧\n📩 如需報價請洽詢", images: [img("沙門_01.png"), img("沙門_01.png"), img("沙門_01.png")] },
   "DM": { label: "富林組合屋 產品DM", description: "富林組合屋\n雲林縣二崙鄉楊賢路143號\n\n單顆入門基礎款（1門2窗）\n3mx6m  NT$98,000\n4mx6m  NT$118,000\n4mx8m  NT$156,000\n\n衛浴加購\n大衛浴 NT$55,000\n小衛浴 NT$40,000\n\n廖先生 0929-010-882\nLine：@aa168", images: [img("DM_01.jpg"), img("DM_02.jpg"), img("DM_03.jpg")] },
 };
-
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
-
 function verifyLineSignature(req, res, next) {
   const sig = req.headers["x-line-signature"];
   if (!sig) return res.status(401).send("Missing signature");
@@ -215,12 +250,10 @@ function verifyLineSignature(req, res, next) {
   if (hash !== sig) return res.status(401).send("Invalid signature");
   next();
 }
-
 function detectProduct(text) {
   for (const key of Object.keys(PRODUCTS)) { if (text.includes("@" + key)) return PRODUCTS[key]; }
   return null;
 }
-
 async function translateText(text, modeKey) {
   const mode = LANG_MODES[modeKey] || LANG_MODES.ZH_TH_EN;
   const r = await axios.post(
@@ -230,7 +263,45 @@ async function translateText(text, modeKey) {
   );
   return r.data.content[0].text;
 }
+// ─── 🤖 @aafulin 智能問答（像 @meta.ai 那樣，什麼都能問，需要即時資訊會自動上網查證） ───
+async function askAI(question) {
+  const r = await axios.post(
+    "https://api.anthropic.com/v1/messages",
+    {
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      system: `你是「aafulin」，一個親切、聰明、講話直接的中文 AI 助理，個性自然不制式，像朋友一樣聊天。
+使用者會用「@aafulin 問題」跟你互動，內容可能是問路、找店家/地址、查天氣、查資料、算數學、閒聊等任何問題，不管問什麼都要盡力回答。
 
+規則：
+1. 只要問題牽涉到地點、地址、營業時間、電話、目前新聞、天氣、價格等「需要查證的即時資訊」，一律使用 web_search 工具實際查證後再回答，不可以憑印象亂猜地址、電話或資訊。
+2. 若使用者問「這附近」、「我這邊」等但沒說明是哪個縣市/地區，先反問對方所在地區，不要瞎猜地點。
+3. 回答要簡短口語，像朋友在 LINE 聊天，不要用 markdown 標題、條列符號或粗體，用簡單句子或換行即可，盡量在 5-6 行內講完。
+4. 查不到明確資訊時要老實說查不到，不要編造地址或內容。
+5. 用繁體中文回覆，除非對方明顯用其他語言提問。`,
+      tools: [
+        {
+          type: "web_search_20250305",
+          name: "web_search",
+          max_uses: 3,
+          user_location: { type: "approximate", country: "TW", timezone: "Asia/Taipei" },
+        },
+      ],
+      messages: [{ role: "user", content: question }],
+    },
+    {
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      timeout: 45000,
+    }
+  );
+  const blocks = r.data.content || [];
+  const answer = blocks.filter(b => b.type === "text").map(b => b.text).join("\n").trim();
+  return answer || "抱歉，這題我暫時查不到明確答案，你可以換個問法再問我一次。";
+}
 async function replyMessages(replyToken, messages, quoteToken = null) {
   if (quoteToken && messages.length > 0) { const ft = messages.find(m => m.type === "text"); if (ft) ft.quoteToken = quoteToken; }
   const r = await axios.post("https://api.line.me/v2/bot/message/reply",
@@ -239,58 +310,47 @@ async function replyMessages(replyToken, messages, quoteToken = null) {
   );
   console.log("[LINE Reply] status:", r.status);
 }
-
 function getSourceId(event) {
   const src = event.source;
   if (src.type === "group") return src.groupId;
   if (src.type === "room") return src.roomId;
   return src.userId;
 }
-
 app.post("/webhook", verifyLineSignature, async (req, res) => {
   res.status(200).send("OK");
   const events = req.body.events || [];
   console.log("[Webhook] events count:", events.length);
-
   for (const event of events) {
     if (event.type !== "message" || event.message.type !== "text") continue;
-
     const text = event.message.text.trim();
     const replyToken = event.replyToken;
     const quoteToken = event.message.quoteToken || null;
     const userId = event.source?.userId || "";
     const sourceId = getSourceId(event);
     const isAdmin = ADMIN_IDS.includes(userId);
-
     console.log("[Message]", text, "| userId:", userId, "| sourceId:", sourceId);
-
     await getOrCreateGroup(sourceId, event.source);
     touchGroup(sourceId);
-
     try {
-
       // 📋 @目錄
       if (["@目錄", "@选单", "@選單", "@menu", "@產品目錄"].includes(text)) {
         const curMode = LANG_MODES[getGroupMode(sourceId)];
         await replyMessages(replyToken, [{
           type: "text",
-          text: `📋 富林組合屋 產品目錄\n（輸入 @品名 查詢詳情）\n\n🏠 框架顏色搭配：\n@黑框木紋　@黑框白板　@黑框灰黑\n@白框木紋　@白框白板　@白框灰黑\n\n🚿 衛浴系列：\n@大衛浴　@小衛浴　@水泥廁所\n@室外衛浴　@貼磁衛浴　@日式衛浴\n\n🏢 屋型系列：\n@二樓　@三樓　@展翼屋　@20呎展翼屋\n@折疊屋　@宿舍\n\n🛋 配件系列：\n@廚具　@SPC地板　@三合一門　@標準窗　@沙門\n\n📩 完整 DM 報價：\n@DM\n\n${"─".repeat(18)}\n🌐 翻譯功能：${curMode.desc}\n@語言設定 查看/切換語言模式`
+          text: `📋 富林組合屋 產品目錄\n（輸入 @品名 查詢詳情）\n\n🏠 框架顏色搭配：\n@黑框木紋　@黑框白板　@黑框灰黑\n@白框木紋　@白框白板　@白框灰黑\n\n🚿 衛浴系列：\n@大衛浴　@小衛浴　@水泥廁所\n@室外衛浴　@貼磁衛浴　@日式衛浴\n\n🏢 屋型系列：\n@二樓　@三樓　@展翼屋　@20呎展翼屋\n@折疊屋　@宿舍\n\n🛋 配件系列：\n@廚具　@SPC地板　@三合一門　@標準窗　@沙門\n\n📩 完整 DM 報價：\n@DM\n\n${"─".repeat(18)}\n🌐 翻譯功能：${curMode.desc}\n@語言設定 查看/切換語言模式\n\n🤖 想問任何問題就打：@aafulin 你的問題`
         }], quoteToken);
         continue;
       }
-
       // 📞 @聯絡
       if (["@聯絡", "@contact", "@联絡"].includes(text)) {
         await replyMessages(replyToken, [{ type: "text", text: `📞 富林工程\n\n服務專線 0929-010-882\nLine：@aa168\n地址：臺南市成功里143號\n\n歡迎加入 Line 洽詢，提供1對1報價服務！` }], quoteToken);
         continue;
       }
-
       // 🔑 @myid
       if (["@myid", "@我的id"].includes(text.toLowerCase())) {
         await replyMessages(replyToken, [{ type: "text", text: `🔑 你的 LINE userId：\n${userId}\n\n📌 群組 ID：\n${sourceId}` }], quoteToken);
         continue;
       }
-
       // 👮 白名單管理
       if (text.startsWith("@加白名單")) {
         if (!isAdmin) { await replyMessages(replyToken, [{ type: "text", text: "❌ 只有管理員可以使用此指令" }], quoteToken); continue; }
@@ -313,7 +373,6 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         await replyMessages(replyToken, [{ type: "text", text: list.length ? `📋 白名單（${list.length} 人）：\n\n${list.join("\n")}` : "📋 白名單目前為空（全部放行）" }], quoteToken);
         continue;
       }
-
       // 🔄 翻譯開關
       if (["@開翻譯", "@翻譯開"].includes(text)) {
         translateEnabled.set(sourceId, true);
@@ -325,7 +384,6 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         await replyMessages(replyToken, [{ type: "text", text: "🔇 翻譯功能已關閉\n\n傳 @開翻譯 重新啟動" }], quoteToken);
         continue;
       }
-
       if (["@翻譯狀態", "@翻译状态"].includes(text)) {
         const on = isTranslateOn(sourceId);
         const cur = LANG_MODES[getGroupMode(sourceId)];
@@ -335,7 +393,6 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         }], quoteToken);
         continue;
       }
-
       // 🌐 語言模式切換
       if (["@語言設定", "@語言模式"].includes(text)) {
         const cur = getGroupMode(sourceId);
@@ -346,7 +403,6 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         }], quoteToken);
         continue;
       }
-
       if (["@開中泰英", "@預設語言"].includes(text)) {
         groupLangMode.set(sourceId, "ZH_TH_EN");
         await replyMessages(replyToken, [{ type: "text", text: "✅ 語言模式：中泰英\n🇹🇼 中文 ↔ 🇹🇭 泰文 ↔ 🇺🇸 英文" }], quoteToken);
@@ -362,7 +418,72 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         await replyMessages(replyToken, [{ type: "text", text: "✅ 語言模式：中英\n🇹🇼 中文 ↔ 🇺🇸 英文" }], quoteToken);
         continue;
       }
-
+      // ════════════════════════════════════════
+      // ⏰ 定時提醒（管理員，公開發群組 @all）
+      // ════════════════════════════════════════
+      // @定時提醒 08:30 記得打卡
+      if (text.startsWith("@定時提醒")) {
+        if (!isAdmin) continue;
+        const match = text.match(/^@定時提醒\s+(\d{1,2}):(\d{2})\s+(.+)$/);
+        if (!match) {
+          await pushMessage(userId, [{
+            type: "text",
+            text: "⚠️ 格式錯誤\n\n正確格式：\n@定時提醒 08:30 記得打卡\n@定時提醒 18:00 今日工作回報\n\n時間為台灣時間（24小時制）"
+          }]);
+          continue;
+        }
+        const hour = parseInt(match[1]);
+        const minute = parseInt(match[2]);
+        const msg = match[3].trim();
+        if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+          await pushMessage(userId, [{ type: "text", text: "⚠️ 時間格式錯誤，請輸入 00:00 ~ 23:59" }]);
+          continue;
+        }
+        if (!groupReminders.has(sourceId)) groupReminders.set(sourceId, []);
+        const list = groupReminders.get(sourceId);
+        const newReminder = { id: reminderIdCounter++, hour, minute, message: msg, timerId: null };
+        list.push(newReminder);
+        scheduleReminder(sourceId, newReminder);
+        const g = await getOrCreateGroup(sourceId, event.source);
+        console.log(`[Reminder] 新增 #${newReminder.id} | 群組：${g.name} | 時間：${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')} | 內容：${msg}`);
+        await pushMessage(userId, [{
+          type: "text",
+          text: `⏰ 定時提醒已設定 #${newReminder.id}\n群組：【${g.name}】\n時間：每天 ${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}（台灣時間）\n內容：${msg}\n\n傳 @提醒列表 查看所有提醒`
+        }]);
+        continue;
+      }
+      // @提醒列表
+      if (["@提醒列表", "@定時列表"].includes(text)) {
+        if (!isAdmin) continue;
+        const list = groupReminders.get(sourceId) || [];
+        if (!list.length) {
+          await pushMessage(userId, [{ type: "text", text: "📋 此群組目前沒有設定定時提醒" }]);
+        } else {
+          const g = await getOrCreateGroup(sourceId, event.source);
+          let msg = `⏰ 【${g.name}】定時提醒（${list.length} 筆）\n\n`;
+          list.forEach(r => {
+            msg += `#${r.id} ${String(r.hour).padStart(2,'0')}:${String(r.minute).padStart(2,'0')} 每天\n　${r.message}\n\n`;
+          });
+          msg += "傳 @刪除提醒 編號 可刪除";
+          await pushMessage(userId, [{ type: "text", text: msg.trim() }]);
+        }
+        continue;
+      }
+      // @刪除提醒 1
+      if (text.startsWith("@刪除提醒")) {
+        if (!isAdmin) continue;
+        const num = parseInt(text.replace(/^@刪除提醒\s*/, "").trim());
+        const list = groupReminders.get(sourceId) || [];
+        const idx = list.findIndex(r => r.id === num);
+        if (idx === -1) {
+          await pushMessage(userId, [{ type: "text", text: `⚠️ 找不到提醒 #${num}，傳 @提醒列表 確認編號` }]);
+          continue;
+        }
+        const removed = list.splice(idx, 1)[0];
+        if (removed.timerId) clearTimeout(removed.timerId);
+        await pushMessage(userId, [{ type: "text", text: `✅ 已刪除定時提醒 #${removed.id}\n${String(removed.hour).padStart(2,'0')}:${String(removed.minute).padStart(2,'0')} ${removed.message}` }]);
+        continue;
+      }
       // 📝 記事系統（管理員，群組靜默）
       if (["@忽略記事", "@忽略"].includes(text)) {
         if (!isAdmin) continue;
@@ -435,15 +556,32 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         await pushMessage(userId, [{ type: "text", text: `🧹 已清除 ${cleared} 筆已完成記事` }]);
         continue;
       }
-
-      // 商品查詢
       const product = detectProduct(text);
       if (product) {
         const imgs = product.images.filter(u => u && u.startsWith("http")).map(u => ({ type: "image", originalContentUrl: u, previewImageUrl: u }));
         await replyMessages(replyToken, [...imgs, { type: "text", text: product.label + "\n\n" + product.description }], quoteToken);
         continue;
       }
-
+      // 🤖 @aafulin 智能問答 —— 像 @meta.ai 一樣，什麼都能問，不管什麼問題都盡量回答
+      const aiMatch = text.match(/^@aafulin[:：]?\s*([\s\S]*)$/i);
+      if (aiMatch) {
+        const question = aiMatch[1].trim();
+        if (!question) {
+          await replyMessages(replyToken, [{
+            type: "text",
+            text: "你好，我是 aafulin 🤖\n直接在後面接你的問題就可以，例如：\n@aafulin 這附近哪裡有賣五金的\n@aafulin 明天台南天氣如何"
+          }], quoteToken);
+          continue;
+        }
+        try {
+          const answer = await askAI(question);
+          await replyMessages(replyToken, [{ type: "text", text: answer }], quoteToken);
+        } catch (err) {
+          console.error("[AI ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
+          await replyMessages(replyToken, [{ type: "text", text: "抱歉，剛剛查詢時出了點問題，請稍後再問我一次。" }], quoteToken);
+        }
+        continue;
+      }
       // 🔔 關鍵字自動記事
       const AUTO_KEYWORDS = ["報價","訂購","預約","確認","合約","付款","匯款","多少錢","什麼時候","可以嗎","麻煩","簽約","要訂","幫我","能不能","何時","幾號","幾點","需要","ราคา","สั่ง","นัด","ยืนยัน","เท่าไร","จ่าย","สัญญา","เมื่อไร","ได้ไหม","ช่วย","ต้องการ","อยาก"];
       const hit = AUTO_KEYWORDS.find(kw => text.includes(kw));
@@ -453,29 +591,24 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         const now = new Date(); const ts = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
         ADMIN_IDS.forEach(aid => pushMessage(aid, [{ type: "text", text: `🔔 自動記事 #${nt.id}\n群組：【${g.name}】\n關鍵字：${hit}\n內容：${nt.text}\n時間：${ts}\n\n傳 @完成 ${nt.id} 標記完成` }]));
       }
-
       // 🌐 翻譯
       if (!isTranslateOn(sourceId)) continue;
       if (!/[\p{L}\p{M}]/u.test(text)) continue;
       const stripped = text.replace(/^@\S+\s*/, "").trim();
       if (!stripped || !/[\p{L}\p{M}]/u.test(stripped)) continue;
-
       const modeKey = getGroupMode(sourceId);
       console.log("[Translate] mode:", modeKey, "input:", stripped.substring(0,50));
       const translated = await translateText(stripped, modeKey);
       console.log("[Translate] output:", translated.substring(0,50));
       await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
-
     } catch (err) {
       console.error("[ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
     }
   }
 });
-
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "fulin-line-bot", products: Object.keys(PRODUCTS).length });
 });
-
 app.listen(PORT, () => {
   console.log("✅ 富林 LINE 機器人啟動，Port:", PORT);
   console.log("ADMIN_IDS:", ADMIN_IDS.length > 0 ? ADMIN_IDS : "未設定");
