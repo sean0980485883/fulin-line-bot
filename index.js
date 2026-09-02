@@ -471,6 +471,29 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         }
         continue;
       }
+      // @全部提醒 —— 管理員在任何地方（含私訊）都能一次看到所有群組的提醒
+      if (["@全部提醒", "@所有提醒"].includes(text)) {
+        if (!isAdmin) continue;
+        let totalCount = 0;
+        let msg = `⏰ 全部群組定時提醒\n${"═".repeat(20)}\n`;
+        for (const [srcId, list] of groupReminders) {
+          if (!list.length) continue;
+          const g = groups.get(srcId);
+          const gName = g ? g.name : srcId.substring(0, 8) + "...";
+          msg += `\n【${gName}】\n`;
+          list.forEach(r => {
+            msg += `#${r.id} ${String(r.hour).padStart(2,'0')}:${String(r.minute).padStart(2,'0')} 每天　${r.message}\n`;
+            totalCount++;
+          });
+        }
+        if (totalCount === 0) {
+          await pushMessage(userId, [{ type: "text", text: "📋 目前沒有任何群組設定定時提醒" }]);
+        } else {
+          msg += `\n${"═".repeat(20)}\n共 ${totalCount} 筆提醒`;
+          await pushMessage(userId, [{ type: "text", text: msg.trim() }]);
+        }
+        continue;
+      }
       // @刪除提醒 1
       if (text.startsWith("@刪除提醒")) {
         if (!isAdmin) continue;
