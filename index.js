@@ -15,6 +15,8 @@ let allowedUsers = process.env.ALLOWED_USER_IDS
   ? new Set(process.env.ALLOWED_USER_IDS.split(",").map(id => id.trim()).filter(Boolean))
   : new Set();
 const ignoredGroups = new Set();
+// 全域開關：關掉之後，所有群組都不會再自動記事（不用一個一個群組打 @忽略記事）
+const AUTO_RECORD_ENABLED = false;
 // ─── 定時提醒系統 ──────────────────────────────────────────────
 // 結構：Map<sourceId, [{id, hour, minute, message, timerId}]>
 const groupReminders = new Map();
@@ -585,7 +587,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       // 🔔 關鍵字自動記事
       const AUTO_KEYWORDS = ["報價","訂購","預約","確認","合約","付款","匯款","多少錢","什麼時候","可以嗎","麻煩","簽約","要訂","幫我","能不能","何時","幾號","幾點","需要","ราคา","สั่ง","นัด","ยืนยัน","เท่าไร","จ่าย","สัญญา","เมื่อไร","ได้ไหม","ช่วย","ต้องการ","อยาก"];
       const hit = AUTO_KEYWORDS.find(kw => text.includes(kw));
-      if (hit && ADMIN_IDS.length > 0 && !isAdmin && !ignoredGroups.has(sourceId)) {
+      if (AUTO_RECORD_ENABLED && hit && ADMIN_IDS.length > 0 && !isAdmin && !ignoredGroups.has(sourceId)) {
         const g = await getOrCreateGroup(sourceId, event.source);
         const nt = { id: taskIdCounter++, text: text.substring(0,80), done: false, createdAt: new Date(), auto: true }; g.tasks.push(nt);
         const now = new Date(); const ts = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
