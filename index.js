@@ -2,12 +2,21 @@ const express = require("express");
 const crypto = require("crypto");
 const axios = require("axios");
 const path = require("path");
+const fs = require("fs");
 const app = express();
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const BASE_URL = process.env.BASE_URL;
 const PORT = process.env.PORT || 3000;
+// ─── 設定持久化 ────────────────────────────────────────────────
+// 每個群組的設定（語言模式、翻譯開關、忽略狀態、記事、定時提醒…）都會存到這個檔案，
+// 重啟後會自動讀回並套用（含重新排定定時提醒）。
+// 若在 Render 加了 Persistent Disk，可設定環境變數 DATA_DIR 指到掛載路徑，
+// 這樣就連「重新部署」也不會遺失設定；沒設定的話預設存在專案資料夾內，
+// 一般的休眠喚醒／程式重啟都不會遺失。
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const STATE_FILE = path.join(DATA_DIR, "state.json");
 const ADMIN_IDS = process.env.ADMIN_IDS
   ? process.env.ADMIN_IDS.split(",").map(id => id.trim()).filter(Boolean)
   : [];
@@ -116,6 +125,33 @@ const LANG_MODES = {
    - 輸入是中文 → 🇺🇸 [英文]
    - 輸入是英文 → 🇹🇼 [中文]
 4. 只輸出翻譯結果，不加冒號、箭頭、語言名稱或任何說明`
+  },
+  ZH_MY_EN: {
+    name: "中緬英",
+    desc: "中文 ↔ 緬甸文 ↔ 英文",
+    system: `你是翻譯助理，翻譯語言範圍：中文、緬甸文、英文。
+規則：
+1. 訊息開頭若有 @人名、@英文名、@符號 等 LINE 提及標記，直接忽略，只翻譯後面的句子內容
+2. 若 @提及 後面沒有任何實質內容，則完全不回應
+3. 翻譯格式（國旗符號 + 空格 + 翻譯，每行一個，不加任何其他文字）：
+   - 輸入是中文 → 🇲🇲 [緬甸文]\n🇺🇸 [英文]
+   - 輸入是緬甸文 → 🇹🇼 [中文]\n🇺🇸 [英文]
+   - 輸入是英文 → 🇹🇼 [中文]\n🇲🇲 [緬甸文]
+4. 只輸出翻譯結果，不加冒號、箭頭、語言名稱或任何說明`
+  },
+  ZH_MY_EN_TH: {
+    name: "中緬英泰",
+    desc: "中文 ↔ 緬甸文 ↔ 英文 ↔ 泰文",
+    system: `你是翻譯助理，翻譯語言範圍：中文、緬甸文、英文、泰文。
+規則：
+1. 訊息開頭若有 @人名、@英文名、@符號 等 LINE 提及標記，直接忽略，只翻譯後面的句子內容
+2. 若 @提及 後面沒有任何實質內容，則完全不回應
+3. 翻譯格式（國旗符號 + 空格 + 翻譯，每行一個，不加任何其他文字）：
+   - 輸入是中文 → 🇲🇲 [緬甸文]\n🇺🇸 [英文]\n🇹🇭 [泰文]
+   - 輸入是緬甸文 → 🇹🇼 [中文]\n🇺🇸 [英文]\n🇹🇭 [泰文]
+   - 輸入是英文 → 🇹🇼 [中文]\n🇲🇲 [緬甸文]\n🇹🇭 [泰文]
+   - 輸入是泰文 → 🇹🇼 [中文]\n🇲🇲 [緬甸文]\n🇺🇸 [英文]
+4. 只輸出翻譯結果，不加冒號、箭頭、語言名稱或任何說明`
   }
 };
 function getGroupMode(sourceId) {
@@ -146,6 +182,7 @@ async function getOrCreateGroup(sourceId, eventSource = null) {
         if (groups.has(sourceId)) {
           groups.get(sourceId).name = name;
           console.log("[GroupName]", name);
+          saveState();
         }
       });
     }
@@ -198,6 +235,81 @@ function buildDailyReport() {
   if (day2.length) { msg += `\n⚪ 2天未說話—明日自動移除（${day2.length} 組）\n${"─".repeat(20)}\n`; day2.forEach(x => { msg += render(x) + "\n"; }); }
   msg += `${"═".repeat(22)}\n共 ${total} 組 | ${totalTasks} 件待辦`;
   return msg;
+}
+// ─── 讀取 / 儲存持久化設定 ────────────────────────────────────
+function serializeState() {
+  return {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    allowedUsers: [...allowedUsers],
+    ignoredGroups: [...ignoredGroups],
+    translateEnabled: Object.fromEntries(translateEnabled),
+    groupLangMode: Object.fromEntries(groupLangMode),
+    taskIdCounter,
+    reminderIdCounter,
+    groups: Object.fromEntries(
+      [...groups].map(([sourceId, g]) => [sourceId, {
+        name: g.name,
+        lastActiveAt: g.lastActiveAt instanceof Date ? g.lastActiveAt.toISOString() : g.lastActiveAt,
+        tasks: g.tasks.map(t => ({
+          ...t,
+          createdAt: t.createdAt instanceof Date ? t.createdAt.toISOString() : t.createdAt,
+          doneAt: t.doneAt instanceof Date ? t.doneAt.toISOString() : t.doneAt,
+        })),
+      }])
+    ),
+    groupReminders: Object.fromEntries(
+      [...groupReminders].map(([sourceId, list]) => [
+        sourceId,
+        list.map(r => ({ id: r.id, hour: r.hour, minute: r.minute, message: r.message })),
+      ])
+    ),
+  };
+}
+function saveState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmpFile = STATE_FILE + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(serializeState(), null, 2));
+    fs.renameSync(tmpFile, STATE_FILE);
+  } catch (err) {
+    console.error("[State] 儲存設定失敗：", err.message);
+  }
+}
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) {
+      console.log("[State] 尚無已儲存設定，使用預設值啟動");
+      return;
+    }
+    const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    (data.allowedUsers || []).forEach(id => allowedUsers.add(id));
+    (data.ignoredGroups || []).forEach(id => ignoredGroups.add(id));
+    Object.entries(data.translateEnabled || {}).forEach(([id, v]) => translateEnabled.set(id, v));
+    Object.entries(data.groupLangMode || {}).forEach(([id, mode]) => groupLangMode.set(id, mode));
+    if (typeof data.taskIdCounter === "number") taskIdCounter = data.taskIdCounter;
+    if (typeof data.reminderIdCounter === "number") reminderIdCounter = data.reminderIdCounter;
+    Object.entries(data.groups || {}).forEach(([sourceId, g]) => {
+      groups.set(sourceId, {
+        name: g.name,
+        lastActiveAt: g.lastActiveAt ? new Date(g.lastActiveAt) : new Date(),
+        tasks: (g.tasks || []).map(t => ({
+          ...t,
+          createdAt: t.createdAt ? new Date(t.createdAt) : new Date(),
+          doneAt: t.doneAt ? new Date(t.doneAt) : undefined,
+        })),
+      });
+    });
+    let restoredReminders = 0;
+    Object.entries(data.groupReminders || {}).forEach(([sourceId, list]) => {
+      const restored = list.map(r => ({ ...r, timerId: null }));
+      groupReminders.set(sourceId, restored);
+      restored.forEach(r => { scheduleReminder(sourceId, r); restoredReminders++; });
+    });
+    console.log(`[State] 已讀回設定：${groups.size} 個群組、${restoredReminders} 筆定時提醒已重新排定`);
+  } catch (err) {
+    console.error("[State] 讀取設定失敗，將使用預設值啟動：", err.message);
+  }
 }
 async function pushMessage(toUserId, messages) {
   try {
@@ -359,6 +471,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         const tid = text.split(/\s+/)[1] || "";
         if (!tid.startsWith("U")) { await replyMessages(replyToken, [{ type: "text", text: "⚠️ 格式：@加白名單 U1234..." }], quoteToken); continue; }
         allowedUsers.add(tid);
+        saveState();
         await replyMessages(replyToken, [{ type: "text", text: `✅ 已新增白名單：${tid}` }], quoteToken);
         continue;
       }
@@ -366,6 +479,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         if (!isAdmin) { await replyMessages(replyToken, [{ type: "text", text: "❌ 只有管理員可以使用此指令" }], quoteToken); continue; }
         const tid = text.split(/\s+/)[1] || "";
         allowedUsers.delete(tid);
+        saveState();
         await replyMessages(replyToken, [{ type: "text", text: `✅ 已移除：${tid}` }], quoteToken);
         continue;
       }
@@ -378,11 +492,13 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       // 🔄 翻譯開關
       if (["@開翻譯", "@翻譯開"].includes(text)) {
         translateEnabled.set(sourceId, true);
+        saveState();
         await replyMessages(replyToken, [{ type: "text", text: "✅ 翻譯功能已開啟" }], quoteToken);
         continue;
       }
       if (["@關翻譯", "@翻譯關"].includes(text)) {
         translateEnabled.set(sourceId, false);
+        saveState();
         await replyMessages(replyToken, [{ type: "text", text: "🔇 翻譯功能已關閉\n\n傳 @開翻譯 重新啟動" }], quoteToken);
         continue;
       }
@@ -401,23 +517,38 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         const curMode = LANG_MODES[cur];
         await replyMessages(replyToken, [{
           type: "text",
-          text: `🌐 目前語言模式：【${curMode.name}】\n${curMode.desc}\n\n${"─".repeat(18)}\n可切換模式：\n\n@開中泰英　中文↔泰文↔英文（預設）\n@開印尼中英　印尼文↔中文↔英文\n@開中英　中文↔英文`
+          text: `🌐 目前語言模式：【${curMode.name}】\n${curMode.desc}\n\n${"─".repeat(18)}\n可切換模式：\n\n@開中泰英　中文↔泰文↔英文（預設）\n@開印尼中英　印尼文↔中文↔英文\n@開中英　中文↔英文\n@開中緬英　中文↔緬甸文↔英文\n@開中緬英泰　中文↔緬甸文↔英文↔泰文`
         }], quoteToken);
         continue;
       }
       if (["@開中泰英", "@預設語言"].includes(text)) {
         groupLangMode.set(sourceId, "ZH_TH_EN");
+        saveState();
         await replyMessages(replyToken, [{ type: "text", text: "✅ 語言模式：中泰英\n🇹🇼 中文 ↔ 🇹🇭 泰文 ↔ 🇺🇸 英文" }], quoteToken);
         continue;
       }
       if (["@開印尼中英", "@印尼模式"].includes(text)) {
         groupLangMode.set(sourceId, "ID_ZH_EN");
+        saveState();
         await replyMessages(replyToken, [{ type: "text", text: "✅ 語言模式：印尼中英\n🇮🇩 印尼文 ↔ 🇹🇼 中文 ↔ 🇺🇸 英文" }], quoteToken);
         continue;
       }
       if (["@開中英", "@中英模式"].includes(text)) {
         groupLangMode.set(sourceId, "ZH_EN");
+        saveState();
         await replyMessages(replyToken, [{ type: "text", text: "✅ 語言模式：中英\n🇹🇼 中文 ↔ 🇺🇸 英文" }], quoteToken);
+        continue;
+      }
+      if (["@開中緬英", "@緬甸模式"].includes(text)) {
+        groupLangMode.set(sourceId, "ZH_MY_EN");
+        saveState();
+        await replyMessages(replyToken, [{ type: "text", text: "✅ 語言模式：中緬英\n🇹🇼 中文 ↔ 🇲🇲 緬甸文 ↔ 🇺🇸 英文" }], quoteToken);
+        continue;
+      }
+      if (["@開中緬英泰", "@中緬泰模式"].includes(text)) {
+        groupLangMode.set(sourceId, "ZH_MY_EN_TH");
+        saveState();
+        await replyMessages(replyToken, [{ type: "text", text: "✅ 語言模式：中緬英泰\n🇹🇼 中文 ↔ 🇲🇲 緬甸文 ↔ 🇺🇸 英文 ↔ 🇹🇭 泰文" }], quoteToken);
         continue;
       }
       // ════════════════════════════════════════
@@ -446,6 +577,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         const newReminder = { id: reminderIdCounter++, hour, minute, message: msg, timerId: null };
         list.push(newReminder);
         scheduleReminder(sourceId, newReminder);
+        saveState();
         const g = await getOrCreateGroup(sourceId, event.source);
         console.log(`[Reminder] 新增 #${newReminder.id} | 群組：${g.name} | 時間：${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')} | 內容：${msg}`);
         await pushMessage(userId, [{
@@ -506,6 +638,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         }
         const removed = list.splice(idx, 1)[0];
         if (removed.timerId) clearTimeout(removed.timerId);
+        saveState();
         await pushMessage(userId, [{ type: "text", text: `✅ 已刪除定時提醒 #${removed.id}\n${String(removed.hour).padStart(2,'0')}:${String(removed.minute).padStart(2,'0')} ${removed.message}` }]);
         continue;
       }
@@ -513,6 +646,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       if (["@忽略記事", "@忽略"].includes(text)) {
         if (!isAdmin) continue;
         ignoredGroups.add(sourceId);
+        saveState();
         const g = await getOrCreateGroup(sourceId, event.source);
         await pushMessage(userId, [{ type: "text", text: `🚫 【${g.name}】已設為忽略\n傳 @恢復記事 可重新啟用` }]);
         continue;
@@ -520,6 +654,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       if (["@恢復記事", "@恢復"].includes(text)) {
         if (!isAdmin) continue;
         ignoredGroups.delete(sourceId);
+        saveState();
         const g = await getOrCreateGroup(sourceId, event.source);
         await pushMessage(userId, [{ type: "text", text: `✅ 【${g.name}】已恢復自動記事` }]);
         continue;
@@ -535,6 +670,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         const name = text.replace(/^@命名\s*/, "").trim();
         if (!name) { await pushMessage(userId, [{ type: "text", text: "⚠️ 格式：@命名 王先生報價群" }]); continue; }
         const g = await getOrCreateGroup(sourceId, event.source); g.name = name;
+        saveState();
         await pushMessage(userId, [{ type: "text", text: `✅ 群組名稱已更新為：【${name}】` }]);
         continue;
       }
@@ -544,6 +680,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         if (!content) { await pushMessage(userId, [{ type: "text", text: "⚠️ 格式：@記事 確認報價" }]); continue; }
         const g = await getOrCreateGroup(sourceId, event.source);
         const nt = { id: taskIdCounter++, text: content, done: false, createdAt: new Date() }; g.tasks.push(nt);
+        saveState();
         await pushMessage(userId, [{ type: "text", text: `📝 已記錄 #${nt.id}\n群組：【${g.name}】\n內容：「${content}」` }]);
         continue;
       }
@@ -554,6 +691,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         if (!found) { await pushMessage(userId, [{ type: "text", text: `⚠️ 找不到 #${num}` }]); continue; }
         if (found.done) { await pushMessage(userId, [{ type: "text", text: `ℹ️ #${num} 已經是完成狀態` }]); continue; }
         found.done = true; found.doneAt = new Date();
+        saveState();
         await pushMessage(userId, [{ type: "text", text: `✅ #${num} 已完成\n「${found.text}」` }]);
         continue;
       }
@@ -562,6 +700,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         const num = parseInt(text.replace(/^@刪除\s*/, "").trim());
         let removed = null; for (const [,g] of groups) { const i = g.tasks.findIndex(t => t.id === num); if (i !== -1) { removed = g.tasks.splice(i,1)[0]; break; } }
         if (!removed) { await pushMessage(userId, [{ type: "text", text: `⚠️ 找不到 #${num}` }]); continue; }
+        saveState();
         await pushMessage(userId, [{ type: "text", text: `🗑 #${num} 已刪除\n「${removed.text}」` }]);
         continue;
       }
@@ -578,6 +717,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       if (text === "@清除已完成") {
         if (!isAdmin) continue;
         let cleared = 0; for (const [,g] of groups) { const b = g.tasks.length; g.tasks = g.tasks.filter(t => !t.done); cleared += b - g.tasks.length; }
+        saveState();
         await pushMessage(userId, [{ type: "text", text: `🧹 已清除 ${cleared} 筆已完成記事` }]);
         continue;
       }
@@ -613,6 +753,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       if (AUTO_RECORD_ENABLED && hit && ADMIN_IDS.length > 0 && !isAdmin && !ignoredGroups.has(sourceId)) {
         const g = await getOrCreateGroup(sourceId, event.source);
         const nt = { id: taskIdCounter++, text: text.substring(0,80), done: false, createdAt: new Date(), auto: true }; g.tasks.push(nt);
+        saveState();
         const now = new Date(); const ts = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
         ADMIN_IDS.forEach(aid => pushMessage(aid, [{ type: "text", text: `🔔 自動記事 #${nt.id}\n群組：【${g.name}】\n關鍵字：${hit}\n內容：${nt.text}\n時間：${ts}\n\n傳 @完成 ${nt.id} 標記完成` }]));
       }
@@ -634,6 +775,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "fulin-line-bot", products: Object.keys(PRODUCTS).length });
 });
+loadState();
 app.listen(PORT, () => {
   console.log("✅ 富林 LINE 機器人啟動，Port:", PORT);
   console.log("ADMIN_IDS:", ADMIN_IDS.length > 0 ? ADMIN_IDS : "未設定");
