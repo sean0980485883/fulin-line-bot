@@ -339,12 +339,8 @@ async function pushMessage(toUserId, messages) {
     console.error("[Push ERROR]", toUserId, err.response ? JSON.stringify(err.response.data) : err.message);
   }
 }
-function scheduleDailyReport() {
-  function getNext() { const n = new Date(); n.setUTCHours(10,0,0,0); if (n <= new Date()) n.setUTCDate(n.getUTCDate()+1); return n - new Date(); }
-  function trigger() { ADMIN_IDS.forEach(id => pushMessage(id, [{ type: "text", text: buildDailyReport() }])); setTimeout(trigger, getNext()); }
-  console.log(`[DailyReport] 下次：${new Date(Date.now()+getNext()).toISOString()}`);
-  setTimeout(trigger, getNext());
-}
+// 注意：每日自動回報已取消（會額外消耗 LINE Push 訊息額度），
+// 改成純被動：想看的時候自己傳 @今日報告／@報告 即可，buildDailyReport() 仍保留給這個指令用。
 app.use("/images", express.static(path.join(__dirname, "public/images")));
 function img(f) { return BASE_URL + "/images/" + encodeURIComponent(f); }
 const PRODUCTS = {
@@ -618,8 +614,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
           });
           msg += "傳 @刪除提醒 編號 可刪除";
           await pushMessage(userId, [{ type: "text", text: msg.trim() }]);
-        }
-        continue;
+        }        continue;
       }
       // @全部提醒 —— 管理員在任何地方（含私訊）都能一次看到所有群組的提醒
       if (["@全部提醒", "@所有提醒"].includes(text)) {
@@ -816,7 +811,5 @@ app.get("/", (req, res) => {
     console.log("✅ 富林 LINE 機器人啟動，Port:", PORT);
     console.log("ADMIN_IDS:", ADMIN_IDS.length > 0 ? ADMIN_IDS : "未設定");
     if (!UPSTASH_CONFIGURED) console.log("[State] ⚠️ 未設定 Upstash，群組設定／定時提醒重啟後會遺失");
-    if (ADMIN_IDS.length > 0) scheduleDailyReport();
-    else console.log("[DailyReport] ⚠️ ADMIN_IDS 未設定");
   });
 })();
