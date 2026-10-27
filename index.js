@@ -614,7 +614,8 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
           });
           msg += "傳 @刪除提醒 編號 可刪除";
           await pushMessage(userId, [{ type: "text", text: msg.trim() }]);
-        }        continue;
+        }
+        continue;
       }
       // @全部提醒 —— 管理員在任何地方（含私訊）都能一次看到所有群組的提醒
       if (["@全部提醒", "@所有提醒"].includes(text)) {
