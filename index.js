@@ -2,21 +2,23 @@ const express = require("express");
 const crypto = require("crypto");
 const axios = require("axios");
 const path = require("path");
-const fs = require("fs");
 const app = express();
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const BASE_URL = process.env.BASE_URL;
 const PORT = process.env.PORT || 3000;
-// ─── 設定持久化 ────────────────────────────────────────────────
-// 每個群組的設定（語言模式、翻譯開關、忽略狀態、記事、定時提醒…）都會存到這個檔案，
-// 重啟後會自動讀回並套用（含重新排定定時提醒）。
-// 若在 Render 加了 Persistent Disk，可設定環境變數 DATA_DIR 指到掛載路徑，
-// 這樣就連「重新部署」也不會遺失設定；沒設定的話預設存在專案資料夾內，
-// 一般的休眠喚醒／程式重啟都不會遺失。
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-const STATE_FILE = path.join(DATA_DIR, "state.json");
+// ─── 設定持久化（Upstash Redis） ──────────────────────────────
+// 每個群組的設定（語言模式、翻譯開關、忽略狀態、記事、定時提醒…）都會存到 Upstash
+// Redis（免費外部服務），不是存在 Render 的本機硬碟。
+// 原因：Render 的本機硬碟只要「重新部署」就會整個清空，免費版/付費版都一樣（除非
+// 額外加購 Persistent Disk）。改存到 Upstash 之後，不管重新部署、休眠喚醒、當機
+// 重啟都不會遺失設定。
+// 設定方式：到 upstash.com 免費建立一個 Redis 資料庫，把它給的 REST URL／TOKEN
+// 填進 Render 環境變數 UPSTASH_REDIS_REST_URL／UPSTASH_REDIS_REST_TOKEN。
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const STATE_KEY = "fulin-line-bot:state";
 const ADMIN_IDS = process.env.ADMIN_IDS
   ? process.env.ADMIN_IDS.split(",").map(id => id.trim()).filter(Boolean)
   : [];
@@ -266,23 +268,38 @@ function serializeState() {
     ),
   };
 }
-function saveState() {
+const UPSTASH_CONFIGURED = !!(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
+async function saveState() {
+  if (!UPSTASH_CONFIGURED) {
+    console.error("[State] 尚未設定 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN，這次設定不會被保存");
+    return;
+  }
   try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmpFile = STATE_FILE + ".tmp";
-    fs.writeFileSync(tmpFile, JSON.stringify(serializeState(), null, 2));
-    fs.renameSync(tmpFile, STATE_FILE);
+    await axios.post(
+      `${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(STATE_KEY)}`,
+      JSON.stringify(serializeState()),
+      { headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`, "Content-Type": "text/plain" }, timeout: 10000 }
+    );
   } catch (err) {
-    console.error("[State] 儲存設定失敗：", err.message);
+    console.error("[State] 儲存設定失敗：", err.response ? JSON.stringify(err.response.data) : err.message);
   }
 }
-function loadState() {
+async function loadState() {
+  if (!UPSTASH_CONFIGURED) {
+    console.log("[State] 尚未設定 Upstash，使用預設值啟動（這次執行期間的設定不會被保存）");
+    return;
+  }
   try {
-    if (!fs.existsSync(STATE_FILE)) {
+    const r = await axios.get(
+      `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(STATE_KEY)}`,
+      { headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` }, timeout: 10000 }
+    );
+    const raw = r.data && r.data.result;
+    if (!raw) {
       console.log("[State] 尚無已儲存設定，使用預設值啟動");
       return;
     }
-    const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const data = JSON.parse(raw);
     (data.allowedUsers || []).forEach(id => allowedUsers.add(id));
     (data.ignoredGroups || []).forEach(id => ignoredGroups.add(id));
     Object.entries(data.translateEnabled || {}).forEach(([id, v]) => translateEnabled.set(id, v));
@@ -306,9 +323,9 @@ function loadState() {
       groupReminders.set(sourceId, restored);
       restored.forEach(r => { scheduleReminder(sourceId, r); restoredReminders++; });
     });
-    console.log(`[State] 已讀回設定：${groups.size} 個群組、${restoredReminders} 筆定時提醒已重新排定`);
+    console.log(`[State] 已從 Upstash 讀回設定：${groups.size} 個群組、${restoredReminders} 筆定時提醒已重新排定`);
   } catch (err) {
-    console.error("[State] 讀取設定失敗，將使用預設值啟動：", err.message);
+    console.error("[State] 讀取設定失敗，將使用預設值啟動：", err.response ? JSON.stringify(err.response.data) : err.message);
   }
 }
 async function pushMessage(toUserId, messages) {
@@ -373,7 +390,7 @@ async function translateText(text, modeKey) {
   const r = await axios.post(
     "https://api.anthropic.com/v1/messages",
     { model: "claude-sonnet-4-6", max_tokens: 1024, system: mode.system, messages: [{ role: "user", content: text }] },
-    { headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout: 30000 }
+    { headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout: 15000 }
   );
   return r.data.content[0].text;
 }
@@ -436,7 +453,8 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
   console.log("[Webhook] events count:", events.length);
   for (const event of events) {
     if (event.type !== "message" || event.message.type !== "text") continue;
-    const text = event.message.text.trim();
+    // 全形「＠」跟半形「@」都當同一個指令符號看待（手機中文輸入法常常會打出全形的＠）
+    const text = event.message.text.trim().replace(/＠/g, "@");
     const replyToken = event.replyToken;
     const quoteToken = event.message.quoteToken || null;
     const userId = event.source?.userId || "";
@@ -674,6 +692,14 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         await pushMessage(userId, [{ type: "text", text: `✅ 群組名稱已更新為：【${name}】` }]);
         continue;
       }
+      // 注意：@事項／@記事列表 的判斷要放在 @記事（新增記事）前面，
+      // 不然 "@記事列表".startsWith("@記事") 會是 true，指令會被新增記事攔截，
+      // 誤把「列表」兩個字記成一筆記事，而且永遠查不到真正的記事清單。
+      if (["@事項", "@記事列表"].includes(text)) {
+        if (!isAdmin) continue;
+        await pushMessage(userId, [{ type: "text", text: getGroupTasksText(sourceId) }]);
+        continue;
+      }
       if (text.startsWith("@記事")) {
         if (!isAdmin) continue;
         const content = text.replace(/^@記事\s*/, "").trim();
@@ -702,11 +728,6 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         if (!removed) { await pushMessage(userId, [{ type: "text", text: `⚠️ 找不到 #${num}` }]); continue; }
         saveState();
         await pushMessage(userId, [{ type: "text", text: `🗑 #${num} 已刪除\n「${removed.text}」` }]);
-        continue;
-      }
-      if (["@事項", "@記事列表"].includes(text)) {
-        if (!isAdmin) continue;
-        await pushMessage(userId, [{ type: "text", text: getGroupTasksText(sourceId) }]);
         continue;
       }
       if (["@今日報告", "@報告"].includes(text)) {
@@ -762,11 +783,25 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       if (!/[\p{L}\p{M}]/u.test(text)) continue;
       const stripped = text.replace(/^@\S+\s*/, "").trim();
       if (!stripped || !/[\p{L}\p{M}]/u.test(stripped)) continue;
+      // 純「(人名)」標註＋表情符號（例如 @Ann (林美玉)🙌✌）不是真的要翻譯的內容，
+      // 先濾掉括號內容跟表情符號，剩下沒有實質文字就直接跳過，不要送去給 Claude，
+      // 避免它回一句「這個訊息只有名字和表情符號…」這種不該出現在群組的說明文字。
+      const forTranslateCheck = stripped
+        .replace(/[\(（][^)）]*[\)）]/g, "")
+        .replace(/\p{Extended_Pictographic}/gu, "")
+        .replace(/[‍️]/g, "")
+        .trim();
+      if (!forTranslateCheck || !/[\p{L}\p{M}]/u.test(forTranslateCheck)) continue;
       const modeKey = getGroupMode(sourceId);
       console.log("[Translate] mode:", modeKey, "input:", stripped.substring(0,50));
-      const translated = await translateText(stripped, modeKey);
-      console.log("[Translate] output:", translated.substring(0,50));
-      await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
+      try {
+        const translated = await translateText(stripped, modeKey);
+        console.log("[Translate] output:", translated.substring(0,50));
+        await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
+      } catch (translateErr) {
+        // 翻譯失敗（常見是 Claude API 逾時／暫時過載）：群組裡不顯示錯誤訊息，只記錄在後台 log
+        console.error("[Translate ERROR]", translateErr.response ? JSON.stringify(translateErr.response.data) : translateErr.message);
+      }
     } catch (err) {
       console.error("[ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
     }
@@ -775,10 +810,13 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "fulin-line-bot", products: Object.keys(PRODUCTS).length });
 });
-loadState();
-app.listen(PORT, () => {
-  console.log("✅ 富林 LINE 機器人啟動，Port:", PORT);
-  console.log("ADMIN_IDS:", ADMIN_IDS.length > 0 ? ADMIN_IDS : "未設定");
-  if (ADMIN_IDS.length > 0) scheduleDailyReport();
-  else console.log("[DailyReport] ⚠️ ADMIN_IDS 未設定");
-});
+(async () => {
+  await loadState();
+  app.listen(PORT, () => {
+    console.log("✅ 富林 LINE 機器人啟動，Port:", PORT);
+    console.log("ADMIN_IDS:", ADMIN_IDS.length > 0 ? ADMIN_IDS : "未設定");
+    if (!UPSTASH_CONFIGURED) console.log("[State] ⚠️ 未設定 Upstash，群組設定／定時提醒重啟後會遺失");
+    if (ADMIN_IDS.length > 0) scheduleDailyReport();
+    else console.log("[DailyReport] ⚠️ ADMIN_IDS 未設定");
+  });
+})();
