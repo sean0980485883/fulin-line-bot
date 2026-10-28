@@ -1,12 +1,10 @@
 const express = require("express");
 const crypto = require("crypto");
 const axios = require("axios");
-const path = require("path");
 const app = express();
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const BASE_URL = process.env.BASE_URL;
 const PORT = process.env.PORT || 3000;
 // ─── 設定持久化（Upstash Redis） ──────────────────────────────
 // 每個群組的設定（語言模式、翻譯開關、忽略狀態、記事、定時提醒…）都會存到 Upstash
@@ -25,9 +23,6 @@ const ADMIN_IDS = process.env.ADMIN_IDS
 let allowedUsers = process.env.ALLOWED_USER_IDS
   ? new Set(process.env.ALLOWED_USER_IDS.split(",").map(id => id.trim()).filter(Boolean))
   : new Set();
-const ignoredGroups = new Set();
-// 全域開關：關掉之後，所有群組都不會再自動記事（不用一個一個群組打 @忽略記事）
-const AUTO_RECORD_ENABLED = false;
 // ─── 定時提醒系統 ──────────────────────────────────────────────
 // 結構：Map<sourceId, [{id, hour, minute, message, timerId}]>
 const groupReminders = new Map();
@@ -175,10 +170,9 @@ async function fetchGroupName(groupId) {
   }
 }
 const groups = new Map();
-let taskIdCounter = 1;
 async function getOrCreateGroup(sourceId, eventSource = null) {
   if (!groups.has(sourceId)) {
-    groups.set(sourceId, { name: sourceId.substring(0, 8) + "...", lastActiveAt: new Date(), tasks: [] });
+    groups.set(sourceId, { name: sourceId.substring(0, 8) + "...", lastActiveAt: new Date() });
     if (eventSource && eventSource.type === "group") {
       fetchGroupName(sourceId).then(name => {
         if (groups.has(sourceId)) {
@@ -194,71 +188,20 @@ async function getOrCreateGroup(sourceId, eventSource = null) {
 function touchGroup(sourceId) {
   if (groups.has(sourceId)) groups.get(sourceId).lastActiveAt = new Date();
 }
-function daysSince(date) {
-  return Math.floor((new Date() - date) / (1000 * 60 * 60 * 24));
-}
-function formatLastActive(date) {
-  const days = daysSince(date);
-  const t = `${String(date.getHours()).padStart(2,"0")}:${String(date.getMinutes()).padStart(2,"0")}`;
-  if (days === 0) return `今天 ${t}`;
-  if (days === 1) return `昨天 ${t}`;
-  return `${String(date.getMonth()+1).padStart(2,"0")}/${String(date.getDate()).padStart(2,"0")} ${t}`;
-}
-function getGroupTasksText(sourceId) {
-  const g = groups.get(sourceId);
-  if (!g) return "📋 此群組尚無記事";
-  const pending = g.tasks.filter(t => !t.done);
-  const done = g.tasks.filter(t => t.done);
-  if (!pending.length && !done.length) return "📋 此群組目前沒有任何記事";
-  let msg = `📋【${g.name}】記事\n`;
-  if (pending.length) { msg += `\n⏳ 未完成（${pending.length} 件）\n`; pending.forEach(t => { msg += `  ${t.id}. ${t.text}\n`; }); }
-  if (done.length) { msg += `\n✅ 已完成（${done.length} 件）\n`; done.forEach(t => { msg += `  ✔ ${t.text}\n`; }); }
-  return msg.trim();
-}
-function buildDailyReport() {
-  const now = new Date();
-  const dateStr = `${now.getFullYear()}/${String(now.getMonth()+1).padStart(2,"0")}/${String(now.getDate()).padStart(2,"0")}`;
-  const active = [], day1 = [], day2 = [];
-  for (const [sourceId, g] of groups) {
-    const pending = g.tasks.filter(t => !t.done);
-    if (!pending.length) continue;
-    const days = daysSince(g.lastActiveAt);
-    if (days === 0) active.push({ g, pending });
-    else if (days === 1) day1.push({ g, pending });
-    else if (days === 2) day2.push({ g, pending });
-  }
-  const total = active.length + day1.length + day2.length;
-  const totalTasks = [...active, ...day1, ...day2].reduce((s, x) => s + x.pending.length, 0);
-  if (!total) return `📋 每日事項回報 ${dateStr} 18:00\n${"═".repeat(22)}\n\n🎉 目前沒有需要追蹤的事項\n\n${"═".repeat(22)}\n共 0 組 | 0 件待辦`;
-  const render = ({ g, pending }) => { let s = `【${g.name}】最後：${formatLastActive(g.lastActiveAt)}\n`; pending.forEach(t => { s += `  ${t.id}. ${t.text}\n`; }); return s; };
-  let msg = `📋 每日事項回報 ${dateStr} 18:00\n${"═".repeat(22)}\n`;
-  if (active.length) { msg += `\n🔴 今日活躍（${active.length} 組）\n${"─".repeat(20)}\n`; active.forEach(x => { msg += render(x) + "\n"; }); }
-  if (day1.length) { msg += `\n🟡 昨日後無新訊息（${day1.length} 組）\n${"─".repeat(20)}\n`; day1.forEach(x => { msg += render(x) + "\n"; }); }
-  if (day2.length) { msg += `\n⚪ 2天未說話—明日自動移除（${day2.length} 組）\n${"─".repeat(20)}\n`; day2.forEach(x => { msg += render(x) + "\n"; }); }
-  msg += `${"═".repeat(22)}\n共 ${total} 組 | ${totalTasks} 件待辦`;
-  return msg;
-}
 // ─── 讀取 / 儲存持久化設定 ────────────────────────────────────
 function serializeState() {
   return {
     version: 1,
     savedAt: new Date().toISOString(),
     allowedUsers: [...allowedUsers],
-    ignoredGroups: [...ignoredGroups],
     translateEnabled: Object.fromEntries(translateEnabled),
     groupLangMode: Object.fromEntries(groupLangMode),
     glossary: Object.fromEntries(GLOSSARY),
-    taskIdCounter,
     reminderIdCounter,
     groups: Object.fromEntries(
       [...groups].map(([sourceId, g]) => [sourceId, {
         name: g.name,
         lastActiveAt: g.lastActiveAt instanceof Date ? g.lastActiveAt.toISOString() : g.lastActiveAt,
-        tasks: g.tasks.map(t => ({
-          ...t,
-          createdAt: t.createdAt instanceof Date ? t.createdAt.toISOString() : t.createdAt,
-          doneAt: t.doneAt instanceof Date ? t.doneAt.toISOString() : t.doneAt,
-        })),
       }])
     ),
     groupReminders: Object.fromEntries(
@@ -302,21 +245,14 @@ async function loadState() {
     }
     const data = JSON.parse(raw);
     (data.allowedUsers || []).forEach(id => allowedUsers.add(id));
-    (data.ignoredGroups || []).forEach(id => ignoredGroups.add(id));
     Object.entries(data.translateEnabled || {}).forEach(([id, v]) => translateEnabled.set(id, v));
     Object.entries(data.groupLangMode || {}).forEach(([id, mode]) => groupLangMode.set(id, mode));
     Object.entries(data.glossary || {}).forEach(([term, note]) => GLOSSARY.set(term, note));
-    if (typeof data.taskIdCounter === "number") taskIdCounter = data.taskIdCounter;
     if (typeof data.reminderIdCounter === "number") reminderIdCounter = data.reminderIdCounter;
     Object.entries(data.groups || {}).forEach(([sourceId, g]) => {
       groups.set(sourceId, {
         name: g.name,
         lastActiveAt: g.lastActiveAt ? new Date(g.lastActiveAt) : new Date(),
-        tasks: (g.tasks || []).map(t => ({
-          ...t,
-          createdAt: t.createdAt ? new Date(t.createdAt) : new Date(),
-          doneAt: t.doneAt ? new Date(t.doneAt) : undefined,
-        })),
       });
     });
     let restoredReminders = 0;
@@ -341,40 +277,16 @@ async function pushMessage(toUserId, messages) {
     console.error("[Push ERROR]", toUserId, err.response ? JSON.stringify(err.response.data) : err.message);
   }
 }
-// 注意：每日自動回報已取消（會額外消耗 LINE Push 訊息額度），
-// 改成純被動：想看的時候自己傳 @今日報告／@報告 即可，buildDailyReport() 仍保留給這個指令用。
-app.use("/images", express.static(path.join(__dirname, "public/images")));
-function img(f) { return BASE_URL + "/images/" + encodeURIComponent(f); }
-const PRODUCTS = {
-  "黑框木紋": { label: "黑框木紋 ★熱門★", description: "黑色鐵框搭配木紋面板，工業風與自然感完美融合\n尺寸：多規格可選\n\n▶️ 影片：https://youtu.be/Xqw4Utll1yk\n📩 如需報價請洽詢", images: ["https://img.youtube.com/vi/Xqw4Utll1yk/maxresdefault.jpg", img("黑框木紋_02.png"), img("黑框木紋_03.jpg")] },
-  "白框木紋": { label: "白框木紋", description: "清爽白框搭配木紋面板，現代簡約風格\n📩 如需報價請洽詢", images: [img("白框木紋_01.jpg"), img("白框木紋_02.jpg"), img("白框木紋_03.jpg")] },
-  "白框白板": { label: "白框白板", description: "全白簡潔設計，適合醫療、辦公空間\n📩 如需報價請洽詢", images: [img("白框白板_01.jpg"), img("白框白板_02.jpg"), img("白框白板_03.jpg")] },
-  "白框灰黑": { label: "白框灰黑", description: "白框搭配灰黑面板，時尚對比設計\n📩 如需報價請洽詢", images: [img("白框灰黑_01.jpg"), img("白框灰黑_02.jpg"), img("白框灰黑_03.jpg")] },
-  "黑框白板": { label: "黑框白板", description: "黑框白面，俐落高對比設計\n📩 如需報價請洽詢", images: [img("黑框白板_01.jpg"), img("黑框白板_02.jpg"), img("黑框白板_03.jpg")] },
-  "黑框灰黑": { label: "黑框灰黑", description: "全黑深色調，沉穩低調的進階選擇\n📩 如需報價請洽詢", images: [img("黑框灰黑_01.jpg"), img("黑框灰黑_02.jpg"), img("黑框灰黑_03.jpg")] },
-  "大衛浴": { label: "大衛浴 120x190x220", description: "尺寸：120x190x220 cm\n寬敞舒適，適合主臥衛浴規劃\n📩 如需報價請洽詢", images: [img("大衛浴_01.png"), img("大衛浴_02.jpg"), img("大衛浴_03.jpg")] },
-  "小衛浴": { label: "小衛浴 110x140x220", description: "尺寸：110x140x220 cm\n緊湊高效，適合次臥或公共衛浴\n📩 如需報價請洽詢", images: [img("小衛浴_01.jpg"), img("小衛浴_02.jpg"), img("小衛浴_03.png")] },
-  "水泥廁所": { label: "水泥廁所", description: "清水模質感，工業Loft風格\n耐用低維護，適合商業空間\n📩 如需報價請洽詢", images: [img("水泥廁所_01.jpg"), img("水泥廁所_02.jpg"), img("水泥廁所_03.jpg")] },
-  "室外衛浴": { label: "室外衛浴", description: "防水耐候設計，適合戶外、露營區、工地\n📩 如需報價請洽詢", images: [img("室外衛浴_01.jpg"), img("室外衛浴_02.jpg"), img("室外衛浴_03.jpg")] },
-  "貼磁衛浴": { label: "貼磁衛浴 1.7x2.3x2", description: "磁磚貼面，質感精緻，適合住宅與飯店\n📩 如需報價請洽詢", images: [img("貼磁衛浴_01.jpg"), img("貼磁衛浴_02.jpg"), img("貼磁衛浴_03.jpg")] },
-  "日式衛浴": { label: "日式衛浴", description: "石紋壁板、黑框玻璃、頂噴花灑，質感飯店級\n含馬桶、洗手台、淋浴間\n📩 如需報價請洽詢", images: [img("日式衛浴_01.jpg"), img("日式衛浴_03.jpg"), img("日式衛浴_04.jpg")] },
-  "二樓": { label: "組合屋 2.1 二樓", description: "2.1m 樓高，靈活空間規劃\n📩 如需報價請洽詢", images: [img("二樓_01.jpg"), img("二樓_02.png"), img("二樓_03.jpg")] },
-  "三樓": { label: "組合屋 2.1 三樓", description: "2.1m 樓高三層設計\n📩 如需報價請洽詢", images: [img("三樓_01.jpg"), img("三樓_02.jpg"), img("三樓_03.jpg")] },
-  "展翼屋": { label: "10呎展翼屋", description: "創新展翼設計，快速展開即可使用\n含衛浴間、水槽\n📩 如需報價請洽詢", images: [img("展翼屋_01.jpg"), img("展翼屋_02.jpg"), img("展翼屋_03.jpg")] },
-  "20呎展翼屋": { label: "20呎展翼屋", description: "加大版展翼設計，空間更寬敞\n📩 如需報價請洽詢", images: [img("展翼屋20_01.jpg"), img("展翼屋20_02.jpg"), img("展翼屋20_03.jpg")] },
-  "折疊屋": { label: "折疊屋", description: "快速折疊展開，吊車即可定位安裝\n📩 如需報價請洽詢", images: [img("折疊屋_01.jpg"), img("折疊屋_02.jpg"), img("折疊屋_03.jpg")] },
-  "宿舍": { label: "組合屋宿舍", description: "大規模多人住宿首選\n📩 如需報價請洽詢", images: [img("宿舍_01.jpg"), img("宿舍_02.jpg"), img("宿舍_03.jpg")] },
-  "廚具": { label: "廚具", description: "組合屋專用廚具，多款風格可選\n📩 如需報價請洽詢", images: [img("廚具_01.jpg"), img("廚具_02.jpg"), img("廚具_03.jpg")] },
-  "SPC地板": { label: "SPC地板", description: "石塑防水耐磨地板，組合屋首選\n色號：826暖灰、809薄荷、819冷灰\n📩 如需報價請洽詢", images: [img("SPC地板_01.jpg"), img("SPC地板_02.jpg"), img("SPC地板_03.jpg")] },
-  "三合一門": { label: "三合一門", description: "氣密、隔熱、防盜三效合一\n📩 如需報價請洽詢", images: [img("三合一門_01.jpg"), img("三合一門_02.jpg"), img("三合一門_01.jpg")] },
-  "標準窗": { label: "標準窗", description: "組合屋標配推拉窗，附紗窗\n📩 如需報價請洽詢", images: [img("標準窗_01.png"), img("標準窗_02.jpg"), img("標準窗_02.jpg")] },
-  "沙門": { label: "沙門（安全紗門）", description: "菱格鐵網安全紗門，通風防盜兼顧\n📩 如需報價請洽詢", images: [img("沙門_01.png"), img("沙門_01.png"), img("沙門_01.png")] },
-  "DM": { label: "富林組合屋 產品DM", description: "富林組合屋\n雲林縣二崙鄉楊賢路143號\n\n單顆入門基礎款（1門2窗）\n3mx6m  NT$98,000\n4mx6m  NT$118,000\n4mx8m  NT$156,000\n\n衛浴加購\n大衛浴 NT$55,000\n小衛浴 NT$40,000\n\n廖先生 0929-010-882\nLine：@aa168", images: [img("DM_01.jpg"), img("DM_02.jpg"), img("DM_03.jpg")] },
-};
 // ─── 📖 詞彙庫：指定詞彙固定怎麼翻（或保留原文不翻），讓同一個詞每次翻譯結果都一致；
 // 預設先放產品/公司名稱，管理員可用 @加詞彙 / @詞彙庫 / @刪除詞彙 自行增減 ───
 const GLOSSARY = new Map(
-  [...Object.keys(PRODUCTS), "富林", "富林組合屋", "澄舍傢俱", "aafulin"].map(term => [term, "保留原文，不要翻譯這個詞"])
+  [
+    "黑框木紋", "白框木紋", "白框白板", "白框灰黑", "黑框白板", "黑框灰黑",
+    "大衛浴", "小衛浴", "水泥廁所", "室外衛浴", "貼磁衛浴", "日式衛浴",
+    "二樓", "三樓", "展翼屋", "20呎展翼屋", "折疊屋", "宿舍",
+    "廚具", "SPC地板", "三合一門", "標準窗", "沙門", "DM",
+    "富林", "富林組合屋", "澄舍傢俱", "aafulin",
+  ].map(term => [term, "保留原文，不要翻譯這個詞"])
 );
 // 以下從「富林組合屋工作台」管理後台的「施作項目（中／泰）」清單匯入，是實際用過、校對過的泰文翻法，
 // 同名詞彙會覆蓋掉上面「保留原文」的預設值 ───
@@ -462,10 +374,6 @@ function verifyLineSignature(req, res, next) {
   if (hash !== sig) return res.status(401).send("Invalid signature");
   next();
 }
-function detectProduct(text) {
-  for (const key of Object.keys(PRODUCTS)) { if (text.includes("@" + key)) return PRODUCTS[key]; }
-  return null;
-}
 // ─── 統一的 Claude API 呼叫：失敗（逾時／過載／暫時性錯誤）會自動重試一次，
 // 避免單次網路或 API 忙線就直接放棄，大幅降低「翻譯沒反應」的機率 ───
 async function callClaudeAPI(payload, timeout, retries = 1) {
@@ -494,9 +402,11 @@ async function translateText(text, modeKey) {
     console.log("[Translate] 快取命中，不呼叫 API");
     return translationCache.get(cacheKey);
   }
+  // 翻譯是整個機器人最重要的功能，失敗容忍度要拉高：最多重試 2 次（共 3 次嘗試）
   const data = await callClaudeAPI(
     { model: "claude-sonnet-5-5", max_tokens: 1024, system: mode.system + buildGlossaryHint(), messages: [{ role: "user", content: text }] },
-    20000
+    20000,
+    2
   );
   const translated = data.content[0].text;
   translationCache.set(cacheKey, translated);
@@ -523,37 +433,6 @@ async function translateThaiImage(base64Image, mediaType) {
     45000
   );
   return data.content[0].text;
-}
-// ─── 🤖 @aafulin 智能問答（像 @meta.ai 那樣，什麼都能問，需要即時資訊會自動上網查證） ───
-async function askAI(question) {
-  const data = await callClaudeAPI(
-    {
-      model: "claude-sonnet-5-5",
-      max_tokens: 1024,
-      system: `你是「aafulin」，一個親切、聰明、講話直接的中文 AI 助理，個性自然不制式，像朋友一樣聊天。
-使用者會用「@aafulin 問題」跟你互動，內容可能是問路、找店家/地址、查天氣、查資料、算數學、閒聊等任何問題，不管問什麼都要盡力回答。
-
-規則：
-1. 只要問題牽涉到地點、地址、營業時間、電話、目前新聞、天氣、價格等「需要查證的即時資訊」，一律使用 web_search 工具實際查證後再回答，不可以憑印象亂猜地址、電話或資訊。
-2. 若使用者問「這附近」、「我這邊」等但沒說明是哪個縣市/地區，先反問對方所在地區，不要瞎猜地點。
-3. 回答要簡短口語，像朋友在 LINE 聊天，不要用 markdown 標題、條列符號或粗體，用簡單句子或換行即可，盡量在 5-6 行內講完。
-4. 查不到明確資訊時要老實說查不到，不要編造地址或內容。
-5. 用繁體中文回覆，除非對方明顯用其他語言提問。`,
-      tools: [
-        {
-          type: "web_search_20250305",
-          name: "web_search",
-          max_uses: 3,
-          user_location: { type: "approximate", country: "TW", timezone: "Asia/Taipei" },
-        },
-      ],
-      messages: [{ role: "user", content: question }],
-    },
-    45000
-  );
-  const blocks = data.content || [];
-  const answer = blocks.filter(b => b.type === "text").map(b => b.text).join("\n").trim();
-  return answer || "抱歉，這題我暫時查不到明確答案，你可以換個問法再問我一次。";
 }
 async function replyMessages(replyToken, messages, quoteToken = null) {
   if (quoteToken && messages.length > 0) { const ft = messages.find(m => m.type === "text"); if (ft) ft.quoteToken = quoteToken; }
@@ -586,18 +465,13 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
     await getOrCreateGroup(sourceId, event.source);
     touchGroup(sourceId);
     try {
-      // 📋 @目錄
+      // 📋 @目錄（精簡版：機器人現在只專注翻譯＋定時提醒兩個功能）
       if (["@目錄", "@选单", "@選單", "@menu", "@產品目錄"].includes(text)) {
         const curMode = LANG_MODES[getGroupMode(sourceId)];
         await replyMessages(replyToken, [{
           type: "text",
-          text: `📋 富林組合屋 產品目錄\n（輸入 @品名 查詢詳情）\n\n🏠 框架顏色搭配：\n@黑框木紋　@黑框白板　@黑框灰黑\n@白框木紋　@白框白板　@白框灰黑\n\n🚿 衛浴系列：\n@大衛浴　@小衛浴　@水泥廁所\n@室外衛浴　@貼磁衛浴　@日式衛浴\n\n🏢 屋型系列：\n@二樓　@三樓　@展翼屋　@20呎展翼屋\n@折疊屋　@宿舍\n\n🛋 配件系列：\n@廚具　@SPC地板　@三合一門　@標準窗　@沙門\n\n📩 完整 DM 報價：\n@DM\n\n${"─".repeat(18)}\n🌐 翻譯功能：${curMode.desc}\n@語言設定 查看/切換語言模式\n📷 回覆/引用泰文照片 + @翻照片　自動翻譯照片裡的泰文\n\n🤖 想問任何問題就打：@aafulin 你的問題`
+          text: `📋 富林 LINE 機器人\n\n🌐 翻譯功能：${curMode.desc}\n開/關：@開翻譯　@關翻譯\n切換語言：@語言設定\n查看詞彙庫：@詞彙庫\n📷 回覆/引用泰文照片 + @翻照片　自動翻譯照片裡的泰文\n\n⏰ 定時提醒（管理員）：\n@定時提醒 08:30 內容\n查看：@提醒列表　@全部提醒`
         }], quoteToken);
-        continue;
-      }
-      // 📞 @聯絡
-      if (["@聯絡", "@contact", "@联絡"].includes(text)) {
-        await replyMessages(replyToken, [{ type: "text", text: `📞 富林工程\n\n服務專線 0929-010-882\nLine：@aa168\n地址：臺南市成功里143號\n\n歡迎加入 Line 洽詢，提供1對1報價服務！` }], quoteToken);
         continue;
       }
       // 🔑 @myid
@@ -782,29 +656,6 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         await pushMessage(userId, [{ type: "text", text: `✅ 已刪除定時提醒 #${removed.id}\n${String(removed.hour).padStart(2,'0')}:${String(removed.minute).padStart(2,'0')} ${removed.message}` }]);
         continue;
       }
-      // 📝 記事系統（管理員，群組靜默）
-      if (["@忽略記事", "@忽略"].includes(text)) {
-        if (!isAdmin) continue;
-        ignoredGroups.add(sourceId);
-        saveState();
-        const g = await getOrCreateGroup(sourceId, event.source);
-        await pushMessage(userId, [{ type: "text", text: `🚫 【${g.name}】已設為忽略\n傳 @恢復記事 可重新啟用` }]);
-        continue;
-      }
-      if (["@恢復記事", "@恢復"].includes(text)) {
-        if (!isAdmin) continue;
-        ignoredGroups.delete(sourceId);
-        saveState();
-        const g = await getOrCreateGroup(sourceId, event.source);
-        await pushMessage(userId, [{ type: "text", text: `✅ 【${g.name}】已恢復自動記事` }]);
-        continue;
-      }
-      if (["@忽略列表"].includes(text)) {
-        if (!isAdmin) continue;
-        if (!ignoredGroups.size) { await pushMessage(userId, [{ type: "text", text: "📋 目前沒有設定忽略的群組" }]); }
-        else { const names = [...ignoredGroups].map(id => { const g = groups.get(id); return g ? `• 【${g.name}】` : `• ${id.substring(0,8)}...`; }).join("\n"); await pushMessage(userId, [{ type: "text", text: `🚫 忽略記事的群組（${ignoredGroups.size} 組）：\n\n${names}` }]); }
-        continue;
-      }
       if (text.startsWith("@命名")) {
         if (!isAdmin) continue;
         const name = text.replace(/^@命名\s*/, "").trim();
@@ -852,82 +703,6 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         await pushMessage(userId, [{ type: "text", text: `✅ 已刪除詞彙：${term}` }]);
         continue;
       }
-      // 注意：@事項／@記事列表 的判斷要放在 @記事（新增記事）前面，
-      // 不然 "@記事列表".startsWith("@記事") 會是 true，指令會被新增記事攔截，
-      // 誤把「列表」兩個字記成一筆記事，而且永遠查不到真正的記事清單。
-      if (["@事項", "@記事列表"].includes(text)) {
-        if (!isAdmin) continue;
-        await pushMessage(userId, [{ type: "text", text: getGroupTasksText(sourceId) }]);
-        continue;
-      }
-      if (text.startsWith("@記事")) {
-        if (!isAdmin) continue;
-        const content = text.replace(/^@記事\s*/, "").trim();
-        if (!content) { await pushMessage(userId, [{ type: "text", text: "⚠️ 格式：@記事 確認報價" }]); continue; }
-        const g = await getOrCreateGroup(sourceId, event.source);
-        const nt = { id: taskIdCounter++, text: content, done: false, createdAt: new Date() }; g.tasks.push(nt);
-        saveState();
-        await pushMessage(userId, [{ type: "text", text: `📝 已記錄 #${nt.id}\n群組：【${g.name}】\n內容：「${content}」` }]);
-        continue;
-      }
-      if (text.startsWith("@完成")) {
-        if (!isAdmin) continue;
-        const num = parseInt(text.replace(/^@完成\s*/, "").trim());
-        let found = null; for (const [,g] of groups) { const t = g.tasks.find(t => t.id === num); if (t) { found = t; break; } }
-        if (!found) { await pushMessage(userId, [{ type: "text", text: `⚠️ 找不到 #${num}` }]); continue; }
-        if (found.done) { await pushMessage(userId, [{ type: "text", text: `ℹ️ #${num} 已經是完成狀態` }]); continue; }
-        found.done = true; found.doneAt = new Date();
-        saveState();
-        await pushMessage(userId, [{ type: "text", text: `✅ #${num} 已完成\n「${found.text}」` }]);
-        continue;
-      }
-      if (text.startsWith("@刪除")) {
-        if (!isAdmin) continue;
-        const num = parseInt(text.replace(/^@刪除\s*/, "").trim());
-        let removed = null; for (const [,g] of groups) { const i = g.tasks.findIndex(t => t.id === num); if (i !== -1) { removed = g.tasks.splice(i,1)[0]; break; } }
-        if (!removed) { await pushMessage(userId, [{ type: "text", text: `⚠️ 找不到 #${num}` }]); continue; }
-        saveState();
-        await pushMessage(userId, [{ type: "text", text: `🗑 #${num} 已刪除\n「${removed.text}」` }]);
-        continue;
-      }
-      if (["@今日報告", "@報告"].includes(text)) {
-        if (!isAdmin) continue;
-        await pushMessage(userId, [{ type: "text", text: buildDailyReport() }]);
-        continue;
-      }
-      if (text === "@清除已完成") {
-        if (!isAdmin) continue;
-        let cleared = 0; for (const [,g] of groups) { const b = g.tasks.length; g.tasks = g.tasks.filter(t => !t.done); cleared += b - g.tasks.length; }
-        saveState();
-        await pushMessage(userId, [{ type: "text", text: `🧹 已清除 ${cleared} 筆已完成記事` }]);
-        continue;
-      }
-      const product = detectProduct(text);
-      if (product) {
-        const imgs = product.images.filter(u => u && u.startsWith("http")).map(u => ({ type: "image", originalContentUrl: u, previewImageUrl: u }));
-        await replyMessages(replyToken, [...imgs, { type: "text", text: product.label + "\n\n" + product.description }], quoteToken);
-        continue;
-      }
-      // 🤖 @aafulin 智能問答 —— 像 @meta.ai 一樣，什麼都能問，不管什麼問題都盡量回答
-      const aiMatch = text.match(/^@aafulin[:：]?\s*([\s\S]*)$/i);
-      if (aiMatch) {
-        const question = aiMatch[1].trim();
-        if (!question) {
-          await replyMessages(replyToken, [{
-            type: "text",
-            text: "你好，我是 aafulin 🤖\n直接在後面接你的問題就可以，例如：\n@aafulin 這附近哪裡有賣五金的\n@aafulin 明天台南天氣如何"
-          }], quoteToken);
-          continue;
-        }
-        try {
-          const answer = await askAI(question);
-          await replyMessages(replyToken, [{ type: "text", text: answer }], quoteToken);
-        } catch (err) {
-          console.error("[AI ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
-          await replyMessages(replyToken, [{ type: "text", text: "抱歉，剛剛查詢時出了點問題，請稍後再問我一次。" }], quoteToken);
-        }
-        continue;
-      }
       // 📷 泰文照片翻譯 —— 對著含泰文的照片「回覆／引用」傳 @翻照片，才會花費用 OCR + 翻譯
       if (["@翻照片", "@翻譯照片", "@翻泰文照片"].includes(text)) {
         const quotedId = event.message.quotedMessageId;
@@ -955,16 +730,6 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         }
         continue;
       }
-      // 🔔 關鍵字自動記事
-      const AUTO_KEYWORDS =["報價","訂購","預約","確認","合約","付款","匯款","多少錢","什麼時候","可以嗎","麻煩","簽約","要訂","幫我","能不能","何時","幾號","幾點","需要","ราคา","สั่ง","นัด","ยืนยัน","เท่าไร","จ่าย","สัญญา","เมื่อไร","ได้ไหม","ช่วย","ต้องการ","อยาก"];
-      const hit = AUTO_KEYWORDS.find(kw => text.includes(kw));
-      if (AUTO_RECORD_ENABLED && hit && ADMIN_IDS.length > 0 && !isAdmin && !ignoredGroups.has(sourceId)) {
-        const g = await getOrCreateGroup(sourceId, event.source);
-        const nt = { id: taskIdCounter++, text: text.substring(0,80), done: false, createdAt: new Date(), auto: true }; g.tasks.push(nt);
-        saveState();
-        const now = new Date(); const ts = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
-        ADMIN_IDS.forEach(aid => pushMessage(aid, [{ type: "text", text: `🔔 自動記事 #${nt.id}\n群組：【${g.name}】\n關鍵字：${hit}\n內容：${nt.text}\n時間：${ts}\n\n傳 @完成 ${nt.id} 標記完成` }]));
-      }
       // 🌐 翻譯
       if (!isTranslateOn(sourceId)) continue;
       if (!/[\p{L}\p{M}]/u.test(text)) continue;
@@ -981,13 +746,38 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       if (!forTranslateCheck || !/[\p{L}\p{M}]/u.test(forTranslateCheck)) continue;
       const modeKey = getGroupMode(sourceId);
       console.log("[Translate] mode:", modeKey, "input:", stripped.substring(0,50));
+      // 翻譯是這個機器人最重要的功能，絕不能讓一句話失敗就憑空消失、使用者完全看不出來：
+      // 1) translateText 本身已經會重試；這裡再分開處理「翻譯失敗」跟「回覆發送失敗」兩種情況，
+      // 2) 回覆失敗（常見是訊息處理太久、replyToken 過期）會改用 push 補發，
+      // 3) 真的翻譯失敗，也會補發一句簡短提示，而不是靜默吞掉。
+      let translated = null;
       try {
-        const translated = await translateText(stripped, modeKey);
+        translated = await translateText(stripped, modeKey);
         console.log("[Translate] output:", translated.substring(0,50));
-        await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
       } catch (translateErr) {
-        // 翻譯失敗（常見是 Claude API 逾時／暫時過載）：群組裡不顯示錯誤訊息，只記錄在後台 log
         console.error("[Translate ERROR]", translateErr.response ? JSON.stringify(translateErr.response.data) : translateErr.message);
+      }
+      if (translated) {
+        try {
+          await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
+        } catch (replyErr) {
+          console.error("[Translate Reply ERROR]", replyErr.response ? JSON.stringify(replyErr.response.data) : replyErr.message);
+          try {
+            await pushMessage(sourceId, [{ type: "text", text: translated }]);
+          } catch (pushErr) {
+            console.error("[Translate Push ERROR]", pushErr.message);
+          }
+        }
+      } else {
+        try {
+          await replyMessages(replyToken, [{ type: "text", text: "⚠️ 這句翻譯暫時失敗，麻煩再傳一次" }], quoteToken);
+        } catch (e) {
+          try {
+            await pushMessage(sourceId, [{ type: "text", text: "⚠️ 剛剛有一句翻譯失敗，麻煩再傳一次" }]);
+          } catch (e2) {
+            console.error("[Translate Fallback ERROR]", e2.message);
+          }
+        }
       }
     } catch (err) {
       console.error("[ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
@@ -995,7 +785,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
   }
 });
 app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "fulin-line-bot", products: Object.keys(PRODUCTS).length });
+  res.json({ status: "ok", service: "fulin-line-bot" });
 });
 (async () => {
   await loadState();
