@@ -415,6 +415,26 @@ async function translateText(text, modeKey) {
   }
   return translated;
 }
+// ─── 翻譯在背景持續重試，絕不在群組顯示任何「翻譯失敗」字樣 ───
+// translateText 本身已經會重試 2 次；如果連這樣都失敗（通常是 Claude API 當下嚴重壅塞），
+// 不要放棄、也不要回一句錯誤訊息嚇到使用者，而是在背景按 5 秒、15 秒、30 秒、60 秒、60 秒
+// 的間隔再試，一旦成功就用 push 把翻譯補發過去；全部重試完還是失敗（非常罕見），只記在後台
+// log，群組裡完全不會看到任何提示文字。
+const BACKGROUND_RETRY_DELAYS = [5000, 15000, 30000, 60000, 60000];
+async function translateInBackgroundAndPush(stripped, modeKey, sourceId) {
+  for (const delay of BACKGROUND_RETRY_DELAYS) {
+    await new Promise(r => setTimeout(r, delay));
+    try {
+      const translated = await translateText(stripped, modeKey);
+      await pushMessage(sourceId, [{ type: "text", text: translated }]);
+      console.log("[Translate Background] 補發成功:", stripped.substring(0, 50));
+      return;
+    } catch (err) {
+      console.error("[Translate Background ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
+    }
+  }
+  console.error("[Translate Background] 多次重試後仍然失敗，放棄（群組裡不會顯示任何訊息）：", stripped.substring(0, 50));
+}
 // ─── 📷 泰文照片翻譯：下載 LINE 圖片內容，用 Claude 視覺能力讀出泰文並翻譯 ───
 async function translateThaiImage(base64Image, mediaType) {
   const data = await callClaudeAPI(
@@ -733,7 +753,10 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       // 🌐 翻譯
       if (!isTranslateOn(sourceId)) continue;
       if (!/[\p{L}\p{M}]/u.test(text)) continue;
-      const stripped = text.replace(/^@\S+\s*/, "").trim();
+      // 開頭可能有「好幾個」@人名標記連在一起（例如 @Ann @Bai__ @Moomookza^_^ 我要一份報價表），
+      // 這裡用 (?:@\S+\s*)+ 把開頭所有連續的 @標記一次全部去掉，只留下真正要翻譯的句子，
+      // 不要讓殘留的 @名字 混進去送給 Claude，確保人名後面的句子一定會被乾淨地翻譯到。
+      const stripped = text.replace(/^(?:@\S+\s*)+/, "").trim();
       if (!stripped || !/[\p{L}\p{M}]/u.test(stripped)) continue;
       // 純「(人名)」標註＋表情符號（例如 @Ann (林美玉)🙌✌）不是真的要翻譯的內容，
       // 先濾掉括號內容跟表情符號，剩下沒有實質文字就直接跳過，不要送去給 Claude，
@@ -746,38 +769,25 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       if (!forTranslateCheck || !/[\p{L}\p{M}]/u.test(forTranslateCheck)) continue;
       const modeKey = getGroupMode(sourceId);
       console.log("[Translate] mode:", modeKey, "input:", stripped.substring(0,50));
-      // 翻譯是這個機器人最重要的功能，絕不能讓一句話失敗就憑空消失、使用者完全看不出來：
-      // 1) translateText 本身已經會重試；這裡再分開處理「翻譯失敗」跟「回覆發送失敗」兩種情況，
-      // 2) 回覆失敗（常見是訊息處理太久、replyToken 過期）會改用 push 補發，
-      // 3) 真的翻譯失敗，也會補發一句簡短提示，而不是靜默吞掉。
-      let translated = null;
+      // 翻譯絕對不能在群組顯示任何「失敗」字樣，也不能就這樣消失不見：
+      // 1) translateText 本身已經會重試 2 次，先盡量在這裡直接用 reply 立即回覆，
+      // 2) reply 失敗（常見是處理太久、replyToken 過期）就改用 push 補發，
+      // 3) 連第 1) 步都失敗，交給背景持續重試（translateInBackgroundAndPush），
+      //    不等待、不卡住後面訊息的處理，成功就 push 補發，群組裡全程不會看到任何錯誤提示。
       try {
-        translated = await translateText(stripped, modeKey);
+        const translated = await translateText(stripped, modeKey);
         console.log("[Translate] output:", translated.substring(0,50));
-      } catch (translateErr) {
-        console.error("[Translate ERROR]", translateErr.response ? JSON.stringify(translateErr.response.data) : translateErr.message);
-      }
-      if (translated) {
         try {
           await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
         } catch (replyErr) {
           console.error("[Translate Reply ERROR]", replyErr.response ? JSON.stringify(replyErr.response.data) : replyErr.message);
-          try {
-            await pushMessage(sourceId, [{ type: "text", text: translated }]);
-          } catch (pushErr) {
+          pushMessage(sourceId, [{ type: "text", text: translated }]).catch(pushErr => {
             console.error("[Translate Push ERROR]", pushErr.message);
-          }
+          });
         }
-      } else {
-        try {
-          await replyMessages(replyToken, [{ type: "text", text: "⚠️ 這句翻譯暫時失敗，麻煩再傳一次" }], quoteToken);
-        } catch (e) {
-          try {
-            await pushMessage(sourceId, [{ type: "text", text: "⚠️ 剛剛有一句翻譯失敗，麻煩再傳一次" }]);
-          } catch (e2) {
-            console.error("[Translate Fallback ERROR]", e2.message);
-          }
-        }
+      } catch (translateErr) {
+        console.error("[Translate ERROR]", translateErr.response ? JSON.stringify(translateErr.response.data) : translateErr.message);
+        translateInBackgroundAndPush(stripped, modeKey, sourceId);
       }
     } catch (err) {
       console.error("[ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
