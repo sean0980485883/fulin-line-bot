@@ -395,7 +395,7 @@ async function askAI(question) {
   const r = await axios.post(
     "https://api.anthropic.com/v1/messages",
     {
-            model: "claude-sonnet-5-5",
+      model: "claude-sonnet-5-5",
       max_tokens: 1024,
       system: `你是「aafulin」，一個親切、聰明、講話直接的中文 AI 助理，個性自然不制式，像朋友一樣聊天。
 使用者會用「@aafulin 問題」跟你互動，內容可能是問路、找店家/地址、查天氣、查資料、算數學、閒聊等任何問題，不管問什麼都要盡力回答。
