@@ -406,7 +406,7 @@ async function translateThaiImage(base64Image, mediaType) {
         ],
       }],
     },
-    { headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout: 30000 }
+    { headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout: 45000 }
   );
   return r.data.content[0].text;
 }
@@ -792,10 +792,11 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
           continue;
         }
         try {
+          console.log("[ImageTranslate] quotedId:", quotedId, "| sourceId:", sourceId);
           const imgResp = await axios.get(`https://api-data.line.me/v2/bot/message/${quotedId}/content`, {
             headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
             responseType: "arraybuffer",
-            timeout: 15000,
+            timeout: 30000,
           });
           const mediaType = (imgResp.headers["content-type"] || "image/jpeg").split(";")[0].trim();
           const base64Image = Buffer.from(imgResp.data).toString("base64");
@@ -803,8 +804,10 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
           const translated = await translateThaiImage(base64Image, mediaType);
           await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
         } catch (err) {
-          console.error("[ImageTranslate ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
-          await replyMessages(replyToken, [{ type: "text", text: "⚠️ 讀取圖片失敗，請確認引用的是一張圖片訊息，或稍後再試一次" }], quoteToken);
+          const status = err.response ? err.response.status : (err.code || "?");
+          const detail = err.response ? JSON.stringify(err.response.data) : err.message;
+          console.error("[ImageTranslate ERROR]", status, detail);
+          await replyMessages(replyToken, [{ type: "text", text: `⚠️ 讀取圖片失敗（錯誤代碼：${status}），請確認引用的是一張圖片訊息，或稍後再試一次` }], quoteToken);
         }
         continue;
       }
