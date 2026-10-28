@@ -485,7 +485,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         const curMode = LANG_MODES[getGroupMode(sourceId)];
         await replyMessages(replyToken, [{
           type: "text",
-          text: `📋 富林組合屋 產品目錄\n（輸入 @品名 查詢詳情）\n\n🏠 框架顏色搭配：\n@黑框木紋　@黑框白板　@黑框灰黑\n@白框木紋　@白框白板　@白框灰黑\n\n🚿 衛浴系列：\n@大衛浴　@小衛浴　@水泥廁所\n@室外衛浴　@貼磁衛浴　@日式衛浴\n\n🏢 屋型系列：\n@二樓　@三樓　@展翼屋　@20呎展翼屋\n@折疊屋　@宿舍\n\n🛋 配件系列：\n@廚具　@SPC地板　@三合一門　@標準窗　@沙門\n\n📩 完整 DM 報價：\n@DM\n\n${"─".repeat(18)}\n🌐 翻譯功能：${curMode.desc}\n@語言設定 查看/切換語言模式\n\n🤖 想問任何問題就打：@aafulin 你的問題`
+          text: `📋 富林組合屋 產品目錄\n（輸入 @品名 查詢詳情）\n\n🏠 框架顏色搭配：\n@黑框木紋　@黑框白板　@黑框灰黑\n@白框木紋　@白框白板　@白框灰黑\n\n🚿 衛浴系列：\n@大衛浴　@小衛浴　@水泥廁所\n@室外衛浴　@貼磁衛浴　@日式衛浴\n\n🏢 屋型系列：\n@二樓　@三樓　@展翼屋　@20呎展翼屋\n@折疊屋　@宿舍\n\n🛋 配件系列：\n@廚具　@SPC地板　@三合一門　@標準窗　@沙門\n\n📩 完整 DM 報價：\n@DM\n\n${"─".repeat(18)}\n🌐 翻譯功能：${curMode.desc}\n@語言設定 查看/切換語言模式\n📷 回覆/引用泰文照片 + @翻照片　自動翻譯照片裡的泰文\n\n🤖 想問任何問題就打：@aafulin 你的問題`
         }], quoteToken);
         continue;
       }
@@ -809,7 +809,7 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         continue;
       }
       // 🔔 關鍵字自動記事
-const AUTO_KEYWORDS = ["報價","訂購","預約","確認","合約","付款","匯款","多少錢","什麼時候","可以嗎","麻煩","簽約","要訂","幫我","能不能","何時","幾號","幾點","需要","ราคา","สั่ง","นัด","ยืนยัน","เท่าไร","จ่าย","สัญญา","เมื่อไร","ได้ไหม","ช่วย","ต้องการ","อยาก"];
+      const AUTO_KEYWORDS =["報價","訂購","預約","確認","合約","付款","匯款","多少錢","什麼時候","可以嗎","麻煩","簽約","要訂","幫我","能不能","何時","幾號","幾點","需要","ราคา","สั่ง","นัด","ยืนยัน","เท่าไร","จ่าย","สัญญา","เมื่อไร","ได้ไหม","ช่วย","ต้องการ","อยาก"];
       const hit = AUTO_KEYWORDS.find(kw => text.includes(kw));
       if (AUTO_RECORD_ENABLED && hit && ADMIN_IDS.length > 0 && !isAdmin && !ignoredGroups.has(sourceId)) {
         const g = await getOrCreateGroup(sourceId, event.source);
