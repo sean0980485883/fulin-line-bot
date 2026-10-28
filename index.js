@@ -247,6 +247,7 @@ function serializeState() {
     ignoredGroups: [...ignoredGroups],
     translateEnabled: Object.fromEntries(translateEnabled),
     groupLangMode: Object.fromEntries(groupLangMode),
+    glossary: Object.fromEntries(GLOSSARY),
     taskIdCounter,
     reminderIdCounter,
     groups: Object.fromEntries(
@@ -304,6 +305,7 @@ async function loadState() {
     (data.ignoredGroups || []).forEach(id => ignoredGroups.add(id));
     Object.entries(data.translateEnabled || {}).forEach(([id, v]) => translateEnabled.set(id, v));
     Object.entries(data.groupLangMode || {}).forEach(([id, mode]) => groupLangMode.set(id, mode));
+    Object.entries(data.glossary || {}).forEach(([term, note]) => GLOSSARY.set(term, note));
     if (typeof data.taskIdCounter === "number") taskIdCounter = data.taskIdCounter;
     if (typeof data.reminderIdCounter === "number") reminderIdCounter = data.reminderIdCounter;
     Object.entries(data.groups || {}).forEach(([sourceId, g]) => {
@@ -369,6 +371,20 @@ const PRODUCTS = {
   "沙門": { label: "沙門（安全紗門）", description: "菱格鐵網安全紗門，通風防盜兼顧\n📩 如需報價請洽詢", images: [img("沙門_01.png"), img("沙門_01.png"), img("沙門_01.png")] },
   "DM": { label: "富林組合屋 產品DM", description: "富林組合屋\n雲林縣二崙鄉楊賢路143號\n\n單顆入門基礎款（1門2窗）\n3mx6m  NT$98,000\n4mx6m  NT$118,000\n4mx8m  NT$156,000\n\n衛浴加購\n大衛浴 NT$55,000\n小衛浴 NT$40,000\n\n廖先生 0929-010-882\nLine：@aa168", images: [img("DM_01.jpg"), img("DM_02.jpg"), img("DM_03.jpg")] },
 };
+// ─── 📖 詞彙庫：指定詞彙固定怎麼翻（或保留原文不翻），讓同一個詞每次翻譯結果都一致；
+// 預設先放產品/公司名稱，管理員可用 @加詞彙 / @詞彙庫 / @刪除詞彙 自行增減 ───
+const GLOSSARY = new Map(
+  [...Object.keys(PRODUCTS), "富林", "富林組合屋", "澄舍傢俱", "aafulin"].map(term => [term, "保留原文，不要翻譯這個詞"])
+);
+function buildGlossaryHint() {
+  if (!GLOSSARY.size) return "";
+  const lines = [...GLOSSARY].map(([term, note]) => `${term} → ${note}`).join("\n");
+  return `\n\n指定詞彙對照表（以下詞彙翻譯時必須照這樣處理，不可自行更改）：\n${lines}`;
+}
+// ─── 🗂 翻譯快取：同一句話（同語言模式下）翻過一次就記住，下次直接回傳，不用再呼叫 API，
+// 省費用也省時間；只存在記憶體，重新部署會清空，上限 500 筆（滿了就丟最舊的） ───
+const translationCache = new Map();
+const TRANSLATION_CACHE_MAX = 500;
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 function verifyLineSignature(req, res, next) {
   const sig = req.headers["x-line-signature"];
@@ -404,11 +420,21 @@ async function callClaudeAPI(payload, timeout, retries = 1) {
 }
 async function translateText(text, modeKey) {
   const mode = LANG_MODES[modeKey] || LANG_MODES.ZH_TH_EN;
+  const cacheKey = `${modeKey}::${text}`;
+  if (translationCache.has(cacheKey)) {
+    console.log("[Translate] 快取命中，不呼叫 API");
+    return translationCache.get(cacheKey);
+  }
   const data = await callClaudeAPI(
-    { model: "claude-sonnet-5-5", max_tokens: 1024, system: mode.system, messages: [{ role: "user", content: text }] },
+    { model: "claude-sonnet-5-5", max_tokens: 1024, system: mode.system + buildGlossaryHint(), messages: [{ role: "user", content: text }] },
     20000
   );
-  return data.content[0].text;
+  const translated = data.content[0].text;
+  translationCache.set(cacheKey, translated);
+  if (translationCache.size > TRANSLATION_CACHE_MAX) {
+    translationCache.delete(translationCache.keys().next().value);
+  }
+  return translated;
 }
 // ─── 📷 泰文照片翻譯：下載 LINE 圖片內容，用 Claude 視覺能力讀出泰文並翻譯 ───
 async function translateThaiImage(base64Image, mediaType) {
@@ -416,7 +442,7 @@ async function translateThaiImage(base64Image, mediaType) {
     {
       model: "claude-sonnet-5-5",
       max_tokens: 1024,
-      system: "你是專業泰文翻譯。使用者會傳一張圖片，裡面可能包含泰文文字（例如公告、收據、合約、對話截圖等）。請仔細讀出圖片中所有泰文文字，並翻譯成繁體中文，直接輸出翻譯結果，不用加「以下是翻譯」之類的開場白或其他說明。如果圖片中完全沒有偵測到泰文文字，就只回覆「⚠️ 這張圖片沒有偵測到泰文文字」，不要翻譯圖片中的其他語言。",
+      system: "你是專業泰文翻譯。使用者會傳一張圖片，裡面可能包含泰文文字（例如公告、收據、合約、對話截圖等）。請仔細讀出圖片中所有泰文文字，並翻譯成繁體中文，直接輸出翻譯結果，不用加「以下是翻譯」之類的開場白或其他說明。如果圖片中完全沒有偵測到泰文文字，就只回覆「⚠️ 這張圖片沒有偵測到泰文文字」，不要翻譯圖片中的其他語言。" + buildGlossaryHint(),
       messages: [{
         role: "user",
         content: [
@@ -717,6 +743,44 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         const g = await getOrCreateGroup(sourceId, event.source); g.name = name;
         saveState();
         await pushMessage(userId, [{ type: "text", text: `✅ 群組名稱已更新為：【${name}】` }]);
+        continue;
+      }
+      // 📖 詞彙庫管理（管理員，群組靜默，結果私訊回傳）
+      if (text.startsWith("@加詞彙")) {
+        if (!isAdmin) continue;
+        const body = text.replace(/^@加詞彙\s*/, "").trim();
+        const eqIdx = body.indexOf("=");
+        if (eqIdx === -1) {
+          await pushMessage(userId, [{
+            type: "text",
+            text: "⚠️ 格式：@加詞彙 原文=翻譯方式\n\n例如：\n@加詞彙 展翼屋=保留原文，不要翻譯\n@加詞彙 坤敬=Khon Kaen（泰國東北府名）"
+          }]);
+          continue;
+        }
+        const term = body.slice(0, eqIdx).trim();
+        const note = body.slice(eqIdx + 1).trim();
+        if (!term || !note) { await pushMessage(userId, [{ type: "text", text: "⚠️ 格式：@加詞彙 原文=翻譯方式" }]); continue; }
+        GLOSSARY.set(term, note);
+        translationCache.clear();
+        saveState();
+        await pushMessage(userId, [{ type: "text", text: `✅ 已新增詞彙：${term} → ${note}` }]);
+        continue;
+      }
+      if (["@詞彙庫", "@詞彙列表"].includes(text)) {
+        if (!isAdmin) continue;
+        if (!GLOSSARY.size) { await pushMessage(userId, [{ type: "text", text: "📖 目前詞彙庫是空的" }]); continue; }
+        const list = [...GLOSSARY].map(([term, note]) => `• ${term} → ${note}`).join("\n");
+        await pushMessage(userId, [{ type: "text", text: `📖 詞彙庫（共 ${GLOSSARY.size} 筆）：\n\n${list}\n\n傳 @刪除詞彙 原文 可刪除` }]);
+        continue;
+      }
+      if (text.startsWith("@刪除詞彙")) {
+        if (!isAdmin) continue;
+        const term = text.replace(/^@刪除詞彙\s*/, "").trim();
+        if (!GLOSSARY.has(term)) { await pushMessage(userId, [{ type: "text", text: `⚠️ 詞彙庫裡沒有「${term}」，傳 @詞彙庫 查看目前清單` }]); continue; }
+        GLOSSARY.delete(term);
+        translationCache.clear();
+        saveState();
+        await pushMessage(userId, [{ type: "text", text: `✅ 已刪除詞彙：${term}` }]);
         continue;
       }
       // 注意：@事項／@記事列表 的判斷要放在 @記事（新增記事）前面，
