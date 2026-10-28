@@ -753,10 +753,13 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
       // 🌐 翻譯
       if (!isTranslateOn(sourceId)) continue;
       if (!/[\p{L}\p{M}]/u.test(text)) continue;
-      // 開頭可能有「好幾個」@人名標記連在一起（例如 @Ann @Bai__ @Moomookza^_^ 我要一份報價表），
-      // 這裡用 (?:@\S+\s*)+ 把開頭所有連續的 @標記一次全部去掉，只留下真正要翻譯的句子，
-      // 不要讓殘留的 @名字 混進去送給 Claude，確保人名後面的句子一定會被乾淨地翻譯到。
-      const stripped = text.replace(/^(?:@\S+\s*)+/, "").trim();
+      // @人名標記不一定在開頭，也常常夾在句子中間（例如「555 @Tam 來丟垃圾也要去喔」），
+      // 之前只處理「開頭」的連續 @標記，像這種中間才出現 @名字的句子，@Tam 會原封不動
+      // 混進送給 Claude 的內容，容易讓翻譯結果變得奇怪，甚至讓 Claude 誤判成「只是提及、
+      // 沒有實質內容」而完全不回應，訊息就這樣消失。
+      // 這裡改成不管 @標記出現在句子的哪個位置，一律全部清掉，只留下真正要翻譯的句子本身，
+      // 確保不管人名標記在前面、後面還是中間，句子都一定會被乾淨地送出並翻譯到。
+      const stripped = text.replace(/@\S+\s*/g, "").trim();
       if (!stripped || !/[\p{L}\p{M}]/u.test(stripped)) continue;
       // 純「(人名)」標註＋表情符號（例如 @Ann (林美玉)🙌✌）不是真的要翻譯的內容，
       // 先濾掉括號內容跟表情符號，剩下沒有實質文字就直接跳過，不要送去給 Claude，
