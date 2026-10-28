@@ -275,6 +275,10 @@ async function pushMessage(toUserId, messages) {
     console.log("[Push] to:", toUserId, "status:", r.status);
   } catch (err) {
     console.error("[Push ERROR]", toUserId, err.response ? JSON.stringify(err.response.data) : err.message);
+    // ⚠️ 重要修正：之前這裡吃掉錯誤後就直接結束，呼叫端完全不知道 push 其實失敗了──
+    // 這正是背景補發邏輯會把「LINE 拒絕空訊息」誤判成「補發成功」的原因之一。
+    // 改成重新丟出錯誤，讓呼叫端（例如背景重試機制）可以正確知道這次失敗、繼續重試。
+    throw err;
   }
 }
 // ─── 📖 詞彙庫：指定詞彙固定怎麼翻（或保留原文不翻），讓同一個詞每次翻譯結果都一致；
@@ -408,7 +412,19 @@ async function translateText(text, modeKey) {
     20000,
     2
   );
-  const translated = data.content[0].text;
+  // ⚠️ 重要修正：Claude 回應的 content 陣列，裡面的區塊「不一定」是單純一個文字區塊
+  // （例如偶爾會夾帶其他類型的區塊），原本直接假設 content[0] 就是文字、讀 content[0].text，
+  // 如果那一塊剛好不是文字類型，.text 會讀到 undefined──而且這個 undefined 不會丟出錯誤，
+  // 會被誤判成「翻譯成功，結果是空的」，接著被存進快取（同一句話之後永遠讀到這個壞掉的
+  // 快取）、被拿去傳給 LINE（LINE 會拒絕空訊息），最後還被背景補發邏輯誤判成「補發成功」
+  // 而停止重試，訊息就這樣悄悄消失、永遠等不到。
+  // 這裡改成在整個 content 陣列裡找「真正是文字類型」的區塊，找不到或是空字串，一律當成
+  // 這次翻譯失敗（丟出錯誤），絕對不要把空結果快取起來或往下傳送，讓重試機制可以正常接手。
+  const textBlock = (data.content || []).find(b => b && b.type === "text" && b.text);
+  const translated = textBlock ? textBlock.text : "";
+  if (!translated) {
+    throw new Error("Claude 回應沒有文字內容：" + JSON.stringify(data).substring(0, 300));
+  }
   translationCache.set(cacheKey, translated);
   if (translationCache.size > TRANSLATION_CACHE_MAX) {
     translationCache.delete(translationCache.keys().next().value);
@@ -452,7 +468,12 @@ async function translateThaiImage(base64Image, mediaType) {
     },
     45000
   );
-  return data.content[0].text;
+  // 跟 translateText 一樣的修正：不要假設 content[0] 一定是文字區塊，要在整個陣列裡找。
+  const textBlock = (data.content || []).find(b => b && b.type === "text" && b.text);
+  if (!textBlock) {
+    throw new Error("Claude 回應沒有文字內容：" + JSON.stringify(data).substring(0, 300));
+  }
+  return textBlock.text;
 }
 async function replyMessages(replyToken, messages, quoteToken = null) {
   if (quoteToken && messages.length > 0) { const ft = messages.find(m => m.type === "text"); if (ft) ft.quoteToken = quoteToken; }
