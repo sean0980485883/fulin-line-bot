@@ -381,19 +381,38 @@ function detectProduct(text) {
   for (const key of Object.keys(PRODUCTS)) { if (text.includes("@" + key)) return PRODUCTS[key]; }
   return null;
 }
+// ─── 統一的 Claude API 呼叫：失敗（逾時／過載／暫時性錯誤）會自動重試一次，
+// 避免單次網路或 API 忙線就直接放棄，大幅降低「翻譯沒反應」的機率 ───
+async function callClaudeAPI(payload, timeout, retries = 1) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await axios.post(
+        "https://api.anthropic.com/v1/messages",
+        payload,
+        { headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout }
+      );
+      return r.data;
+    } catch (err) {
+      lastErr = err;
+      const status = err.response ? err.response.status : (err.code || "?");
+      console.warn(`[ClaudeAPI] 第 ${attempt + 1} 次呼叫失敗（${status}）${attempt < retries ? "，準備重試" : "，放棄"}`);
+      if (attempt < retries) await new Promise(res => setTimeout(res, 1000));
+    }
+  }
+  throw lastErr;
+}
 async function translateText(text, modeKey) {
   const mode = LANG_MODES[modeKey] || LANG_MODES.ZH_TH_EN;
-  const r = await axios.post(
-    "https://api.anthropic.com/v1/messages",
+  const data = await callClaudeAPI(
     { model: "claude-sonnet-5-5", max_tokens: 1024, system: mode.system, messages: [{ role: "user", content: text }] },
-    { headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout: 15000 }
+    20000
   );
-  return r.data.content[0].text;
+  return data.content[0].text;
 }
 // ─── 📷 泰文照片翻譯：下載 LINE 圖片內容，用 Claude 視覺能力讀出泰文並翻譯 ───
 async function translateThaiImage(base64Image, mediaType) {
-  const r = await axios.post(
-    "https://api.anthropic.com/v1/messages",
+  const data = await callClaudeAPI(
     {
       model: "claude-sonnet-5-5",
       max_tokens: 1024,
@@ -406,14 +425,13 @@ async function translateThaiImage(base64Image, mediaType) {
         ],
       }],
     },
-    { headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout: 45000 }
+    45000
   );
-  return r.data.content[0].text;
+  return data.content[0].text;
 }
 // ─── 🤖 @aafulin 智能問答（像 @meta.ai 那樣，什麼都能問，需要即時資訊會自動上網查證） ───
 async function askAI(question) {
-  const r = await axios.post(
-    "https://api.anthropic.com/v1/messages",
+  const data = await callClaudeAPI(
     {
       model: "claude-sonnet-5-5",
       max_tokens: 1024,
@@ -436,16 +454,9 @@ async function askAI(question) {
       ],
       messages: [{ role: "user", content: question }],
     },
-    {
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      timeout: 45000,
-    }
+    45000
   );
-  const blocks = r.data.content || [];
+  const blocks = data.content || [];
   const answer = blocks.filter(b => b.type === "text").map(b => b.text).join("\n").trim();
   return answer || "抱歉，這題我暫時查不到明確答案，你可以換個問法再問我一次。";
 }
