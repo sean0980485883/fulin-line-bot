@@ -390,6 +390,26 @@ async function translateText(text, modeKey) {
   );
   return r.data.content[0].text;
 }
+// ─── 📷 泰文照片翻譯：下載 LINE 圖片內容，用 Claude 視覺能力讀出泰文並翻譯 ───
+async function translateThaiImage(base64Image, mediaType) {
+  const r = await axios.post(
+    "https://api.anthropic.com/v1/messages",
+    {
+      model: "claude-sonnet-5-5",
+      max_tokens: 1024,
+      system: "你是專業泰文翻譯。使用者會傳一張圖片，裡面可能包含泰文文字（例如公告、收據、合約、對話截圖等）。請仔細讀出圖片中所有泰文文字，並翻譯成繁體中文，直接輸出翻譯結果，不用加「以下是翻譯」之類的開場白或其他說明。如果圖片中完全沒有偵測到泰文文字，就只回覆「⚠️ 這張圖片沒有偵測到泰文文字」，不要翻譯圖片中的其他語言。",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mediaType, data: base64Image } },
+          { type: "text", text: "請讀出並翻譯這張圖片裡的泰文內容" },
+        ],
+      }],
+    },
+    { headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout: 30000 }
+  );
+  return r.data.content[0].text;
+}
 // ─── 🤖 @aafulin 智能問答（像 @meta.ai 那樣，什麼都能問，需要即時資訊會自動上網查證） ───
 async function askAI(question) {
   const r = await axios.post(
@@ -764,8 +784,32 @@ app.post("/webhook", verifyLineSignature, async (req, res) => {
         }
         continue;
       }
+      // 📷 泰文照片翻譯 —— 對著含泰文的照片「回覆／引用」傳 @翻照片，才會花費用 OCR + 翻譯
+      if (["@翻照片", "@翻譯照片", "@翻泰文照片"].includes(text)) {
+        const quotedId = event.message.quotedMessageId;
+        if (!quotedId) {
+          await replyMessages(replyToken, [{ type: "text", text: "⚠️ 請先「回覆／引用」那張含泰文的照片，再傳 @翻照片" }], quoteToken);
+          continue;
+        }
+        try {
+          const imgResp = await axios.get(`https://api-data.line.me/v2/bot/message/${quotedId}/content`, {
+            headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+            responseType: "arraybuffer",
+            timeout: 15000,
+          });
+          const mediaType = (imgResp.headers["content-type"] || "image/jpeg").split(";")[0].trim();
+          const base64Image = Buffer.from(imgResp.data).toString("base64");
+          console.log("[ImageTranslate] sourceId:", sourceId, "| mediaType:", mediaType, "| bytes:", imgResp.data.length);
+          const translated = await translateThaiImage(base64Image, mediaType);
+          await replyMessages(replyToken, [{ type: "text", text: translated }], quoteToken);
+        } catch (err) {
+          console.error("[ImageTranslate ERROR]", err.response ? JSON.stringify(err.response.data) : err.message);
+          await replyMessages(replyToken, [{ type: "text", text: "⚠️ 讀取圖片失敗，請確認引用的是一張圖片訊息，或稍後再試一次" }], quoteToken);
+        }
+        continue;
+      }
       // 🔔 關鍵字自動記事
-      const AUTO_KEYWORDS = ["報價","訂購","預約","確認","合約","付款","匯款","多少錢","什麼時候","可以嗎","麻煩","簽約","要訂","幫我","能不能","何時","幾號","幾點","需要","ราคา","สั่ง","นัด","ยืนยัน","เท่าไร","จ่าย","สัญญา","เมื่อไร","ได้ไหม","ช่วย","ต้องการ","อยาก"];
+const AUTO_KEYWORDS = ["報價","訂購","預約","確認","合約","付款","匯款","多少錢","什麼時候","可以嗎","麻煩","簽約","要訂","幫我","能不能","何時","幾號","幾點","需要","ราคา","สั่ง","นัด","ยืนยัน","เท่าไร","จ่าย","สัญญา","เมื่อไร","ได้ไหม","ช่วย","ต้องการ","อยาก"];
       const hit = AUTO_KEYWORDS.find(kw => text.includes(kw));
       if (AUTO_RECORD_ENABLED && hit && ADMIN_IDS.length > 0 && !isAdmin && !ignoredGroups.has(sourceId)) {
         const g = await getOrCreateGroup(sourceId, event.source);
