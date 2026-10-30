@@ -33,6 +33,10 @@ function getTWNow() {
   const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   return tw;
 }
+// 台灣時間的「今天日期」字串（YYYY-MM-DD），用來判斷某個提醒今天到底發過了沒有
+function getTWDateString(twDate = getTWNow()) {
+  return `${twDate.getUTCFullYear()}-${String(twDate.getUTCMonth() + 1).padStart(2, "0")}-${String(twDate.getUTCDate()).padStart(2, "0")}`;
+}
 function getNextTriggerMs(hour, minute) {
   const now = new Date();
   const tw = new Date(now.getTime() + 8 * 60 * 60 * 1000);
@@ -45,13 +49,34 @@ function getNextTriggerMs(hour, minute) {
 }
 function scheduleReminder(sourceId, reminder) {
   const { hour, minute, message, id } = reminder;
-  function trigger() {
-    const tw = getTWNow();
+  function doFire() {
     console.log(`[Reminder #${id}] 發送提醒到 ${sourceId}：${message}`);
     // 在群組發送真的 @全體 通知 + 提醒內容
     pushToGroup(sourceId, `⏰ ${message}`);
+    reminder.lastFiredDate = getTWDateString();
+    saveState();
+  }
+  function trigger() {
+    doFire();
     // 設定下一次（24小時後）
     reminder.timerId = setTimeout(trigger, getNextTriggerMs(hour, minute));
+  }
+  // ⚠️ 重要修正：Render 免費方案沒有流量時會整個把伺服器關掉（不是單純睡著），
+  // 這裡排的 setTimeout 計時器也會跟著消失。如果關機的那段時間剛好跨過今天的提醒時間點，
+  // 伺服器醒來後只會重新排「明天」的提醒，今天這一次就這樣悄悄漏掉，使用者完全不會知道。
+  // 這裡加一個補發機制：只要是「已經生效過的提醒」（lastFiredDate 有值，代表不是剛建立的新提醒）
+  // 重新排程時，發現今天這個時間點已經過了、但今天還沒發過，就立刻補發一次，不用等到明天。
+  // （剛用 @定時提醒 新建立的提醒 lastFiredDate 是 undefined，不會觸發補發，
+  //   避免「設定的時間剛好是今天稍早」被誤判成漏發而馬上狂發一次。）
+  if (reminder.lastFiredDate) {
+    const tw = getTWNow();
+    const todayStr = getTWDateString(tw);
+    const todayScheduledPassed =
+      tw.getUTCHours() > hour || (tw.getUTCHours() === hour && tw.getUTCMinutes() >= minute);
+    if (todayScheduledPassed && reminder.lastFiredDate !== todayStr) {
+      console.log(`[Reminder #${id}] 偵測到今天的提醒被漏掉了（伺服器可能剛才休眠/重啟過），立即補發一次`);
+      doFire();
+    }
   }
   const delay = getNextTriggerMs(hour, minute);
   const nextTW = new Date(Date.now() + delay + 8 * 60 * 60 * 1000);
@@ -207,7 +232,7 @@ function serializeState() {
     groupReminders: Object.fromEntries(
       [...groupReminders].map(([sourceId, list]) => [
         sourceId,
-        list.map(r => ({ id: r.id, hour: r.hour, minute: r.minute, message: r.message })),
+        list.map(r => ({ id: r.id, hour: r.hour, minute: r.minute, message: r.message, lastFiredDate: r.lastFiredDate || null })),
       ])
     ),
   };
